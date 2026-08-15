@@ -1,0 +1,48 @@
+{
+  "entities": {
+    "articles": {
+      "title": "Article",
+      "description": "Short-news and editorial articles, reviews, polls, galleries, and interactive items",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "type": { "type": "string" },
+        "category": { "type": "string" },
+        "author": { "type": "string" },
+        "date": { "type": "string" },
+        "views": { "type": "number" },
+        "bookmarks": { "type": "number" },
+        "shares": { "type": "number" },
+        "status": { "type": "string", "enum": ["Live", "Draft", "Scheduled", "Archived"] },
+        "pinPosition": { "type": "number" },
+        "summary": { "type": "string" },
+        "fullContent": { "type": "string" },
+        "featureImage": { "type": "string" },
+        "pushNotification": { "type": "boolean" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["title", "type", "category", "author"]
+    },
+    "app_settings": {
+      "title": "AppSettings",
+      "description": "Global application configuration settings",
+      "type": "object",
+      "properties": {
+        "reelsEnabled": { "type": "boolean" },
+        "siteName": { "type": "string" }
+      },
+      "required": ["reelsEnabled"]
+    }
+  },
+  "firestore": {
+    "/articles/{articleId}": {
+      "schema": "articles",
+      "description": "Collection storing all published and drafted news items"
+    },
+    "/app_settings/{settingId}": {
+      "schema": "app_settings",
+      "description": "Global settings and feature flags"
+    }
+  }
+}
+

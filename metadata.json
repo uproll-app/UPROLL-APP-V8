@@ -1,0 +1,6 @@
+{
+  "name": "Uproll",
+  "description": "Interactive mobile cinema short-news reader and minimal content management dashboard with realtime Firestore synchronization, 60-word cards, live polls, trivia quizzes, and IMDb reviews.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
