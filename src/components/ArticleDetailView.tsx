@@ -293,7 +293,7 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
         {/* Feature Image Passed From Main Card */}
         {article.featureImage && (
           <div
-            className={`relative w-full h-[240px] sm:h-[300px] rounded-2xl overflow-hidden shadow-xl border ${
+            className={`relative w-full h-[240px] sm:h-[300px] rounded-t-2xl rounded-b-none overflow-hidden shadow-xl border ${
               isWhiteMode ? 'border-slate-200' : 'border-zinc-800/90'
             }`}
           >

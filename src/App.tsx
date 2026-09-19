@@ -11,6 +11,96 @@ import { FlutterCodeViewer } from './components/FlutterCodeViewer';
 import { WhiteCmsDashboard } from './components/WhiteCmsDashboard';
 import { AppScreen } from './types';
 import { Smartphone, LayoutGrid, Sparkles, Columns2, ExternalLink } from 'lucide-react';
+import { onAuthStateChanged, signInWithEmailAndPassword, signOut, User } from 'firebase/auth';
+import { auth } from './lib/firebase';
+
+type AdminRole = 'admin' | 'editor' | 'writer' | 'analyst' | 'viewer';
+
+const DASHBOARD_ROLES = new Set<AdminRole>([
+  'admin',
+  'editor',
+  'writer',
+  'analyst',
+  'viewer',
+]);
+
+function AdminAccessGate({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [role, setRole] = useState<AdminRole | null>(null);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    return onAuthStateChanged(auth, async (nextUser) => {
+      setUser(nextUser);
+      setRole(null);
+      if (!nextUser) {
+        setChecking(false);
+        return;
+      }
+
+      const token = await nextUser.getIdTokenResult(true);
+      const nextRole = token.claims.role as AdminRole | undefined;
+      setRole(nextRole && DASHBOARD_ROLES.has(nextRole) ? nextRole : null);
+      setChecking(false);
+    });
+  }, []);
+
+  if (checking) {
+    return <div className="min-h-screen grid place-items-center bg-slate-950 text-white">Checking admin access...</div>;
+  }
+
+  if (!user) return <AdminLogin />;
+
+  if (!role) {
+    return (
+      <div className="min-h-screen grid place-items-center bg-slate-950 px-6 text-center text-white">
+        <div className="max-w-md space-y-4">
+          <h1 className="text-2xl font-black">Dashboard access is not assigned</h1>
+          <p className="text-slate-400">Ask an administrator to assign an admin, editor, writer, analyst, or viewer role.</p>
+          <button onClick={() => signOut(auth)} className="rounded-xl bg-emerald-500 px-4 py-2 font-bold text-slate-950">Sign out</button>
+        </div>
+      </div>
+    );
+  }
+
+  return <>{children}</>;
+}
+
+function AdminLogin() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+    } catch {
+      setError('Sign-in failed. Use an invited employee account.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="min-h-screen bg-slate-950 grid place-items-center px-5 text-white">
+      <form onSubmit={submit} className="w-full max-w-md space-y-5 rounded-3xl border border-slate-800 bg-slate-900 p-7 shadow-2xl">
+        <div>
+          <p className="text-xs font-black uppercase tracking-[0.24em] text-emerald-400">UPROLL</p>
+          <h1 className="mt-2 text-3xl font-black">Editorial Dashboard</h1>
+          <p className="mt-2 text-sm text-slate-400">Sign in with your invited employee account.</p>
+        </div>
+        <label className="block text-sm font-bold">Company email<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" required className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-white outline-none focus:border-emerald-400" /></label>
+        <label className="block text-sm font-bold">Password<input value={password} onChange={(event) => setPassword(event.target.value)} type="password" required className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-white outline-none focus:border-emerald-400" /></label>
+        {error && <p className="rounded-xl bg-red-500/10 p-3 text-sm text-red-300">{error}</p>}
+        <button disabled={loading} className="w-full rounded-xl bg-emerald-500 px-4 py-3 font-black text-slate-950 disabled:opacity-50">{loading ? 'Signing in...' : 'Sign in'}</button>
+      </form>
+    </main>
+  );
+}
 
 export default function App() {
   const [viewMode, setViewMode] = useState<'cms' | 'reader' | 'split'>('cms');
@@ -181,6 +271,7 @@ export default function App() {
   );
 
   return (
+    <AdminAccessGate>
     <div className={`w-full bg-[#070A10] text-white flex flex-col ${viewMode === 'cms' ? 'h-screen overflow-hidden p-0' : 'min-h-screen p-2 sm:p-4'} font-sans antialiased`}>
       {/* Top Header Mode Switcher */}
       <header className={`w-full shrink-0 ${viewMode === 'cms' ? 'px-3 py-1.5 bg-slate-950 border-b border-slate-800/80 z-40' : 'max-w-7xl mb-2 px-2 mx-auto'} flex items-center justify-between gap-2 flex-wrap transition-all`}>
@@ -299,6 +390,7 @@ export default function App() {
         onClose={() => setShowFlutterCode(false)}
       />
     </div>
+    </AdminAccessGate>
   );
 }
 

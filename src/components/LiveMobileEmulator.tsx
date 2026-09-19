@@ -51,6 +51,7 @@ export interface LiveMobileEmulatorProps {
   movieVerdict?: string;
   movieDirector?: string;
   movieCast?: string;
+  movieCastMembers?: Array<{ name: string; characterName?: string; imageUrl?: string }>;
   movieMusicDirector?: string;
   movieCinematography?: string;
   movieRuntime?: string;
@@ -85,6 +86,7 @@ export function LiveMobileEmulator({
   movieVerdict = 'MUST WATCH',
   movieDirector = 'Director',
   movieCast = '',
+  movieCastMembers = [],
   movieMusicDirector = '',
   movieCinematography = '',
   movieRuntime = '2h 30m',
@@ -503,10 +505,10 @@ export function LiveMobileEmulator({
                       <Film className="w-4 h-4" />
                     </div>
                     <div className="min-w-0">
-                      <div className="text-[11px] font-black text-amber-950 truncate">
+                      <div className="text-[13px] font-black text-amber-950 truncate">
                         {movieDirector ? `Dir: ${movieDirector}` : 'Cinema Review'}
                       </div>
-                      <div className="text-[9.5px] text-amber-800 font-medium">
+                      <div className="text-[11px] text-amber-800 font-medium">
                         {movieYear} • {movieCertificate}
                       </div>
                     </div>
@@ -517,6 +519,26 @@ export function LiveMobileEmulator({
                     <span>{movieRating || '8.6'}/10</span>
                   </div>
                 </div>
+              </div>
+            )}
+
+            {formatType === 'movie_review' && galleryImages.length > 0 && (
+              <div className="flex gap-2 overflow-x-auto mb-2">
+                {galleryImages.slice(0, 10).map((image, index) => (
+                  <img key={`${image}-${index}`} src={image} alt={`Related ${index + 1}`} className="w-24 h-16 object-cover rounded-lg shrink-0" referrerPolicy="no-referrer" />
+                ))}
+              </div>
+            )}
+
+            {formatType === 'movie_review' && movieCastMembers.length > 0 && (
+              <div className="flex gap-2 overflow-x-auto mb-2">
+                {movieCastMembers.slice(0, 15).map((member, index) => (
+                  <div key={`${member.name}-${index}`} className="w-16 shrink-0 text-center">
+                    <img src={member.imageUrl || ''} alt={member.name} className="w-12 h-12 mx-auto rounded-full object-cover bg-slate-200" referrerPolicy="no-referrer" />
+                    <div className="text-[10px] font-bold text-slate-700 truncate">{member.name}</div>
+                    <div className="text-[9px] text-slate-500 truncate">{member.characterName}</div>
+                  </div>
+                ))}
               </div>
             )}
 
@@ -535,11 +557,11 @@ export function LiveMobileEmulator({
             {/* Card Summary / Synopsis Body - In a Modern Box if Movie Review */}
             {formatType === 'movie_review' ? (
               <div className="flex-1 min-h-[70px] mb-2 p-2.5 rounded-xl bg-amber-50/50 border border-amber-200/80 space-y-1 overflow-y-auto no-scrollbar">
-                <div className="text-[10px] font-black text-amber-600 uppercase tracking-wider flex items-center gap-1">
+                <div className="text-[12px] font-black text-amber-600 uppercase tracking-wider flex items-center gap-1">
                   <Sparkles className="w-3 h-3 text-amber-500" />
                   <span>Synopsis</span>
                 </div>
-                <p className="text-[12.5px] text-slate-700 leading-relaxed whitespace-pre-line font-medium">
+                <p className="text-[14px] text-slate-700 leading-relaxed whitespace-pre-line font-medium">
                   {displaySummary}
                 </p>
               </div>

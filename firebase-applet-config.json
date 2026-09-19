@@ -1,11 +1,11 @@
 {
-  "projectId": "oval-quartet-gq6d2",
-  "appId": "1:749894228302:web:3b27bca32b68aadb43261f",
-  "apiKey": "AIzaSyDIm1AgdIPngU2tDpy47wb-GwY-lsYZssM",
-  "authDomain": "oval-quartet-gq6d2.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-uproll-0550eb1d-d3b1-4b00-ba72-ae2363b78d68",
-  "storageBucket": "oval-quartet-gq6d2.firebasestorage.app",
-  "messagingSenderId": "749894228302",
+  "projectId": "uproll-test-app",
+  "appId": "1:1015375815649:web:1c701777cda781cac0a8a0",
+  "apiKey": "AIzaSyC8IXnA9kiKGDGyEERb1uXw-3fjhVw3JgI",
+  "authDomain": "uproll-test-app.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "uproll-test-app.firebasestorage.app",
+  "messagingSenderId": "1015375815649",
   "measurementId": "",
   "oAuthClientId": "749894228302-q6opiffno6k7mcge9sgfupvlolr667b9.apps.googleusercontent.com",
   "recaptchaSiteKey": ""

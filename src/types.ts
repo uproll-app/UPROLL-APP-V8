@@ -24,12 +24,17 @@ export interface ArticleData {
   category: string;
   genres?: string[];
   featureImage: string;
+  pollBackgroundImage?: string;
+  attachedToStoryId?: string;
   summary: string;
+  synopsis?: string;
   fullContent?: string;
   videoUrl?: string;
   detailImage?: string;
   priority?: string;
   galleryImages?: string[];
+  relatedImages?: string[];
+  relatedImageUrls?: string[];
   isPushNotification?: boolean;
   director?: string;
   author?: string;
@@ -38,6 +43,7 @@ export interface ArticleData {
   verdict?: string;
   starRating?: number;
   cast?: string;
+  castMembers?: { name: string; characterName?: string; imageUrl?: string }[];
   musicDirector?: string;
   cinematography?: string;
   runtime?: string;
@@ -46,6 +52,10 @@ export interface ArticleData {
   negatives?: string[];
   trailerUrl?: string;
   year?: string;
+  releaseDate?: string;
+  country?: string;
+  language?: string | string[];
+  productionCompany?: string;
   duration?: string;
   votesCount?: string;
   badgeTag?: string;
@@ -59,6 +69,7 @@ export interface ArticleData {
   choiceOptions?: any[];
   cardThemeColor?: string;
   status?: string;
+  releaseStatus?: 'Released' | 'Not yet released';
   isPinned?: boolean;
   audienceReviews?: {
     id: string;

@@ -1,18 +1,20 @@
 import {
   collection,
   doc,
-  getDocs,
   addDoc,
   updateDoc,
   deleteDoc,
   onSnapshot,
-  query,
-  orderBy,
   setDoc,
   getDoc,
-  serverTimestamp,
 } from 'firebase/firestore';
-import { db } from './firebase';
+import {
+  getDownloadURL,
+  ref,
+  uploadBytes,
+  uploadBytesResumable,
+} from 'firebase/storage';
+import { auth, db, storage } from './firebase';
 import { ArticleData } from '../types';
 
 export interface ReaderAnswerItem {
@@ -37,10 +39,16 @@ export interface MovieFeedbackItem {
 export interface ExtendedArticleData extends ArticleData {
   status?: 'Live' | 'Draft' | 'Archived';
   createdAt?: number;
+  updatedAt?: number;
+  createdBy?: string;
+  updatedBy?: string;
+  source?: string;
   totalVotes?: number;
   question?: string;
   userResponsesCount?: number;
   cardThemeColor?: string;
+  pollBackgroundImage?: string;
+  attachedToStoryId?: string;
   cardCoverImage?: string;
   badgeTag?: string;
   headerOverlay?: boolean;
@@ -61,10 +69,415 @@ export interface ExtendedArticleData extends ArticleData {
   redirectTargetUrl?: string;
   monetizationType?: 'full_image' | 'gallery' | 'standard' | 'ad_article';
   brandLogoUrl?: string;
+  videoUrl?: string;
 }
 
-const ARTICLES_COLLECTION = 'articles';
 const SETTINGS_COLLECTION = 'app_settings';
+const FIRESTORE_WRITE_TIMEOUT_MS = 15000;
+const STORAGE_UPLOAD_TIMEOUT_MS = 120000;
+const STORAGE_UPLOAD_RETRIES = 2;
+
+export type DatabaseMode = 'firebase' | 'local';
+
+export interface AppSettings {
+  reelsEnabled: boolean;
+  databaseMode: DatabaseMode;
+}
+
+const LOCAL_DATABASE_URL = import.meta.env.VITE_LOCAL_DATABASE_URL || 'http://localhost:8788';
+let activeDatabaseMode: DatabaseMode = 'firebase';
+
+export function setActiveDatabaseMode(mode: DatabaseMode): void {
+  activeDatabaseMode = mode;
+}
+
+export async function migrateFirebaseToLocalDatabase(): Promise<number> {
+  const result = await localDatabaseRequest<{ migrated: number }>('/api/migrate/firebase', {
+    method: 'POST',
+  });
+  return result.migrated;
+}
+
+export async function setLocalDatabaseMode(mode: DatabaseMode): Promise<void> {
+  await localDatabaseRequest('/api/settings/databaseMode', {
+    method: 'PUT',
+    body: JSON.stringify({ value: mode }),
+  });
+}
+
+async function localDatabaseRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${LOCAL_DATABASE_URL}${path}`, {
+    ...init,
+    headers: { 'content-type': 'application/json', ...(init?.headers || {}) },
+  });
+  if (!response.ok) {
+    throw new Error(`Local database request failed: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+function normalizeImageLink(source: string): string {
+  try {
+    const url = new URL(source);
+    if (url.hostname.endsWith('wikipedia.org')) {
+      const fileMarker = '#/media/File:';
+      const markerIndex = url.hash.indexOf(fileMarker);
+      if (markerIndex >= 0) {
+        const fileName = decodeURIComponent(
+          url.hash.substring(markerIndex + fileMarker.length),
+        );
+        return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(fileName)}`;
+      }
+    }
+  } catch {
+    // Keep the original value for validation below.
+  }
+  return source;
+}
+
+export async function uploadVideoFile(file: File, articleId: string): Promise<string> {
+  const extension = file.name.split('.').pop() || 'mp4';
+  if (activeDatabaseMode === 'local') {
+    const fileName = `${articleId}.${extension}`;
+    const response = await fetch(`${LOCAL_DATABASE_URL}/api/media/${encodeURIComponent(fileName)}`, {
+      method: 'PUT',
+      headers: { 'content-type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    if (!response.ok) throw new Error(`Local media upload failed: ${response.status}`);
+    return `${LOCAL_DATABASE_URL}/media/${encodeURIComponent(fileName)}`;
+  }
+  const videoRef = ref(storage, `content-videos/${articleId}.${extension}`);
+  await uploadBytes(videoRef, file, { contentType: file.type || 'video/mp4' });
+  return getDownloadURL(videoRef);
+}
+
+export async function uploadImageDataUrl(
+  dataUrl: string,
+  articleId: string,
+  assetName: string,
+): Promise<string> {
+  const source = normalizeImageLink(dataUrl.trim());
+  const isDataImage = source.startsWith('data:image/');
+  const isRemoteImage = source.startsWith('http://') || source.startsWith('https://');
+  if (!isDataImage && !isRemoteImage) return source;
+
+  let response: Response;
+  try {
+    response = await fetch(source);
+    if (!response.ok) return source;
+    if (!response.headers.get('content-type')?.startsWith('image/')) return source;
+  } catch {
+    return source;
+  }
+  const blob = await response.blob();
+  let uploadBlob = blob;
+  try {
+    const bitmap = await createImageBitmap(blob);
+    const maxDimension = 800;
+    const scale = Math.min(
+      1,
+      maxDimension / Math.max(bitmap.width, bitmap.height),
+    );
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    uploadBlob = await new Promise<Blob>((resolve) =>
+      canvas.toBlob(
+        (compressed) => resolve(compressed ?? blob),
+        'image/jpeg',
+        0.55,
+      ),
+    );
+    bitmap.close();
+  } catch {
+    uploadBlob = blob;
+  }
+  if (activeDatabaseMode === 'local') {
+    const fileName = `${articleId}-${assetName}.jpg`;
+    const response = await fetch(`${LOCAL_DATABASE_URL}/api/media/${encodeURIComponent(fileName)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'image/jpeg' },
+      body: uploadBlob,
+    });
+    if (!response.ok) throw new Error(`Local image upload failed: ${response.status}`);
+    return `${LOCAL_DATABASE_URL}/media/${encodeURIComponent(fileName)}`;
+  }
+  const imageRef = ref(storage, `content-images/${articleId}/${assetName}.jpg`);
+  try {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= STORAGE_UPLOAD_RETRIES; attempt += 1) {
+      try {
+        await uploadBlobWithTimeout(imageRef, uploadBlob);
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < STORAGE_UPLOAD_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+        }
+      }
+    }
+    if (lastError) throw lastError;
+    return await withFirestoreTimeout(
+      getDownloadURL(imageRef),
+      `Image URL lookup timed out after ${STORAGE_UPLOAD_TIMEOUT_MS / 1000} seconds`,
+      STORAGE_UPLOAD_TIMEOUT_MS,
+    );
+  } catch (error) {
+    console.error('Error uploading article image to Firebase Storage:', error);
+    throw error;
+  }
+}
+
+function uploadBlobWithTimeout(
+  imageRef: ReturnType<typeof ref>,
+  blob: Blob,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const task = uploadBytesResumable(imageRef, blob, {
+      contentType: 'image/jpeg',
+    });
+    const timeoutId = setTimeout(() => {
+      task.cancel();
+      reject(
+        new Error(
+          `Image upload timed out after ${STORAGE_UPLOAD_TIMEOUT_MS / 1000} seconds`,
+        ),
+      );
+    }, STORAGE_UPLOAD_TIMEOUT_MS);
+
+    task.on(
+      'state_changed',
+      undefined,
+      (error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      },
+      () => {
+        clearTimeout(timeoutId);
+        resolve();
+      },
+    );
+  });
+}
+
+export async function uploadImageDataUrls(
+  dataUrls: string[],
+  articleId: string,
+): Promise<string[]> {
+  return Promise.all(
+    dataUrls.map((dataUrl, index) =>
+      uploadImageDataUrl(dataUrl, articleId, `image-${index}`),
+    ),
+  );
+}
+
+const CONTENT_COLLECTIONS = [
+  'news',
+  'galleries',
+  'polls',
+  'quizzes',
+  'reviews',
+  'ads',
+] as const;
+
+type ContentCollection = (typeof CONTENT_COLLECTIONS)[number];
+
+function collectionForArticle(article: Partial<ExtendedArticleData>): ContentCollection {
+  if (article.isSponsored && article.monetizationType) return 'ads';
+  switch (article.type) {
+    case 'gallery':
+    case 'full_gallery':
+      return 'galleries';
+    case 'poll':
+      return 'polls';
+    case 'quiz':
+      return 'quizzes';
+    case 'movie':
+    case 'movie_review':
+      return 'reviews';
+    default:
+      return 'news';
+  }
+}
+
+function normalizeReaderArticle(
+  id: string,
+  sourceCollection: ContentCollection,
+  data: Record<string, any>,
+): ExtendedArticleData {
+  const galleryImages = Array.isArray(data.imageUrls)
+    ? data.imageUrls
+    : Array.isArray(data.images)
+      ? data.images
+      : Array.isArray(data.galleryImages)
+        ? data.galleryImages
+        : Array.isArray(data.relatedImages)
+          ? data.relatedImages
+        : [];
+  const type = sourceCollection === 'galleries'
+    ? 'gallery'
+    : sourceCollection === 'polls'
+      ? 'poll'
+      : sourceCollection === 'quizzes'
+        ? 'quiz'
+        : sourceCollection === 'reviews'
+          ? 'movie_review'
+          : sourceCollection === 'ads'
+            ? 'news'
+            : 'news';
+
+  const isPollOrQuizCollection = sourceCollection === 'polls' || sourceCollection === 'quizzes';
+  const pollBackgroundImage =
+    data.pollBackgroundImage ||
+    data.backgroundImageUrl ||
+    data.imageUrl ||
+    data.featureImage ||
+    data.posterUrl ||
+    '';
+
+  return {
+    id,
+    ...data,
+    title: data.title || data.name || data.question || '',
+    category: data.category || 'General',
+    summary: data.summary || data.body || '',
+    type,
+    featureImage: isPollOrQuizCollection
+      ? pollBackgroundImage
+      : data.imageUrl || data.featureImage || data.pollBackgroundImage || galleryImages[0] || data.posterUrl || '',
+    pollBackgroundImage,
+    galleryImages,
+    choiceOptions:
+      data.choiceOptions || data.options || data.pollOptions || data.answers || [],
+    status: data.isPublished === true || data.status === 'Live' ? 'Live' : 'Draft',
+    _contentCollection: sourceCollection,
+  } as unknown as ExtendedArticleData;
+}
+
+function readerPayload(
+  article: Partial<ExtendedArticleData> & { title: string },
+  collectionName: ContentCollection,
+) {
+  const base = {
+    title: article.title,
+    summary: article.summary || '',
+    fullContent: article.fullContent || '',
+    isPublished: article.status === 'Live',
+    status: article.status || 'Draft',
+    category: article.category || 'General',
+    source: article.source || article.author || 'UPROLL Editorial Desk',
+    timeAgo: article.date || 'Just now',
+    updatedAt: Date.now(),
+    ...(article.redirectTargetUrl
+      ? {
+          videoUrl: article.redirectTargetUrl,
+          redirectTargetUrl: article.redirectTargetUrl,
+          youtubeUrl: article.redirectTargetUrl,
+        }
+      : {}),
+    ...(article.videoUrl ? { videoUrl: article.videoUrl } : {}),
+    ...(article.createdAt ? { createdAt: article.createdAt } : { createdAt: Date.now() }),
+    ...(article.createdBy || auth.currentUser?.uid
+      ? { createdBy: article.createdBy || auth.currentUser?.uid }
+      : {}),
+    ...(auth.currentUser?.uid ? { updatedBy: auth.currentUser.uid } : {}),
+  };
+
+  if (collectionName === 'galleries') {
+    return {
+      ...base,
+      imageUrls: (article.galleryImages?.length
+        ? article.galleryImages
+        : [article.featureImage].filter(Boolean)).slice(0, 10),
+    };
+  }
+
+  if (collectionName === 'polls' || collectionName === 'quizzes') {
+    const options = (article.choiceOptions || []).map((option: any, index) => {
+      const label = typeof option === 'string' ? option : option.text || option.label || '';
+      const votes = typeof option === 'object' ? Number(option.votes || 0) : 0;
+      return {
+        id: String(option.id || index + 1),
+        label,
+        text: label,
+        percent: Number(option.percent || 0),
+        votes,
+        ...(collectionName === 'quizzes' && option.isCorrect !== undefined
+          ? { isCorrect: option.isCorrect }
+          : {}),
+      };
+    });
+    const pollBackgroundImage = article.pollBackgroundImage || article.featureImage || '';
+    return {
+      ...base,
+      question: article.question || article.title,
+      ...(article.attachedToStoryId
+        ? { attachedToStoryId: article.attachedToStoryId }
+        : {}),
+      imageUrl: pollBackgroundImage,
+      featureImage: pollBackgroundImage,
+      pollBackgroundImage,
+      options,
+      votes: Number(article.totalVotes || article.userResponsesCount || 0),
+    };
+  }
+
+  if (collectionName === 'reviews') {
+    return {
+      ...base,
+      imageUrl: article.featureImage || '',
+      ...(article.attachedToStoryId
+        ? { attachedToStoryId: article.attachedToStoryId }
+        : {}),
+      synopsis: article.synopsis || article.summary || '',
+      score: Number(article.starRating || article.rating || 0),
+      ratingCount: Number(article.audienceRatingsCount || 0),
+      ...(article.director ? { director: article.director } : {}),
+      ...(article.cast ? { cast: article.cast } : {}),
+      ...(article.castMembers ? { castMembers: article.castMembers.slice(0, 15) } : {}),
+      ...(article.relatedImages || article.galleryImages
+        ? {
+            relatedImages: (article.relatedImages || article.galleryImages || []).slice(0, 10),
+            relatedImageUrls: (article.relatedImages || article.galleryImages || []).slice(0, 10),
+          }
+        : {}),
+      ...(article.genres ? { genres: article.genres.slice(0, 4) } : {}),
+      ...(article.releaseDate ? { releaseDate: article.releaseDate } : {}),
+      ...(article.country ? { country: article.country } : {}),
+      ...(article.language ? { language: article.language } : {}),
+      ...(article.productionCompany ? { productionCompany: article.productionCompany } : {}),
+      ...(article.runtime ? { runtime: article.runtime } : {}),
+      ...(article.certificate ? { certificate: article.certificate } : {}),
+      ...(article.status ? { status: article.status } : {}),
+      ...(article.releaseStatus ? { releaseStatus: article.releaseStatus } : {}),
+    };
+  }
+
+  if (collectionName === 'ads') {
+    return {
+      ...base,
+      advertiser: article.sponsorName || article.author || '',
+      body: article.fullContent || article.summary || '',
+      imageUrls: article.galleryImages?.slice(0, 10) || [article.featureImage].filter(Boolean),
+      ctaLabel: article.ctaButtonLabel || 'Learn more',
+      destinationUrl: article.redirectTargetUrl || '',
+      priority: 0,
+      format: article.monetizationType === 'gallery' ? 'gallery' : 'fullImage',
+      isActive: article.status === 'Live',
+    };
+  }
+
+  return {
+    ...base,
+    imageUrl: article.featureImage || '',
+    readTime: '2 min read',
+    accent: 0xFF0E7490,
+    icon: article.category || 'article',
+  };
+}
 
 export const INITIAL_SEED_ARTICLES: ExtendedArticleData[] = [
   {
@@ -294,66 +707,118 @@ export const INITIAL_SEED_ARTICLES: ExtendedArticleData[] = [
 // Subscribe to real-time updates from Firestore
 export function subscribeToArticles(
   onData: (articles: ExtendedArticleData[]) => void,
-  onError?: (err: Error) => void
+  onError?: (err: Error) => void,
+  mode: DatabaseMode = activeDatabaseMode,
 ) {
-  try {
-    const articlesRef = collection(db, ARTICLES_COLLECTION);
-    const q = query(articlesRef, orderBy('createdAt', 'desc'));
-
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        if (snapshot.empty) {
-          // Auto-seed if database is empty
-          seedArticlesIfEmpty().then(() => {
-            // Re-query handled by onSnapshot
-          });
-          onData(INITIAL_SEED_ARTICLES);
-          return;
+  if (mode === 'local') {
+    let stopped = false;
+    const load = async () => {
+      try {
+        const payload = await localDatabaseRequest<{
+          items: Array<{ id: string; collection: ContentCollection; data: Record<string, any> }>;
+        }>('/api/content?collections=' + CONTENT_COLLECTIONS.join(','));
+        if (!stopped) {
+          onData(payload.items.map((item) => normalizeReaderArticle(item.id, item.collection, item.data)));
         }
+      } catch (error) {
+        if (!stopped) onError?.(error instanceof Error ? error : new Error('Local database unavailable'));
+      }
+    };
+    void load();
+    const interval = window.setInterval(load, 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+    };
+  }
 
-        const list: ExtendedArticleData[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          return {
-            id: docSnap.id,
-            ...data,
-          } as ExtendedArticleData;
-        });
-
-        onData(list);
+  const byCollection = new Map<ContentCollection, ExtendedArticleData[]>();
+  const unsubscribe = CONTENT_COLLECTIONS.map((collectionName) => {
+    const articlesRef = collection(db, collectionName);
+    return onSnapshot(
+      articlesRef,
+      (snapshot) => {
+        byCollection.set(
+          collectionName,
+          snapshot.docs.map((docSnap) =>
+            normalizeReaderArticle(docSnap.id, collectionName, docSnap.data()),
+          ),
+        );
+        const merged = Array.from(byCollection.values())
+          .flat()
+          .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
+        onData(merged);
       },
       (error) => {
-        console.warn('Firestore onSnapshot error, falling back to seed:', error);
-        if (onError) onError(error);
-        onData(INITIAL_SEED_ARTICLES);
-      }
+        console.warn(`Firestore ${collectionName} subscription error:`, error);
+        onError?.(error);
+      },
     );
-  } catch (err: any) {
-    console.error('subscribeToArticles error:', err);
-    if (onError) onError(err);
-    onData(INITIAL_SEED_ARTICLES);
-    return () => {};
-  }
+  });
+
+  return () => unsubscribe.forEach((stop) => stop());
+}
+
+export interface InteractionStats {
+  totalVotes: number;
+  optionVotes: Record<string, number>;
+  totalWatched: number;
+  totalRatings: number;
+  ratingSum: number;
+  averageRating: number;
+  ratingCounts: Record<string, number>;
+}
+
+export function subscribeToInteractionStats(
+  onData: (stats: Record<string, InteractionStats>) => void,
+  onError?: (error: Error) => void,
+) {
+  return onSnapshot(
+    collection(db, 'interaction_events'),
+    (snapshot) => {
+      const stats: Record<string, InteractionStats> = {};
+      snapshot.docs.forEach((event) => {
+        const data = event.data();
+        const contentId = String(data.contentId || '');
+        if (!contentId) return;
+        const current = stats[contentId] || {
+          totalVotes: 0,
+          optionVotes: {},
+          totalWatched: 0,
+          totalRatings: 0,
+          ratingSum: 0,
+          averageRating: 0,
+          ratingCounts: {},
+        };
+        if (data.action === 'vote') {
+          const option = String(data.optionIndex ?? '0');
+          current.totalVotes += 1;
+          current.optionVotes[option] = (current.optionVotes[option] || 0) + 1;
+        } else if (data.action === 'rating') {
+          const rating = Number(data.rating || 0);
+          if (rating >= 1 && rating <= 5) {
+            current.totalRatings += 1;
+            current.ratingSum += rating;
+            const key = String(rating);
+            current.ratingCounts[key] = (current.ratingCounts[key] || 0) + 1;
+          }
+        } else if (data.action === 'watched' && data.watched === true) {
+          current.totalWatched += 1;
+        }
+        current.averageRating = current.totalRatings
+          ? current.ratingSum / current.totalRatings
+          : 0;
+        stats[contentId] = current;
+      });
+      onData(stats);
+    },
+    (error) => onError?.(error),
+  );
 }
 
 // Seed initial articles if collection is empty
 export async function seedArticlesIfEmpty(): Promise<void> {
-  try {
-    const articlesRef = collection(db, ARTICLES_COLLECTION);
-    const snapshot = await getDocs(articlesRef);
-    if (snapshot.empty) {
-      for (const article of INITIAL_SEED_ARTICLES) {
-        const { id, ...articleWithoutId } = article;
-        await setDoc(doc(articlesRef, id), {
-          ...articleWithoutId,
-          createdAt: article.createdAt || Date.now(),
-        });
-      }
-      console.log('Firebase Firestore successfully seeded with initial feed items!');
-    }
-  } catch (err) {
-    console.warn('Failed to seed articles in Firestore:', err);
-  }
+  return;
 }
 
 // Sanitize payloads to ensure Firestore never receives `undefined` values
@@ -383,9 +848,10 @@ export async function createArticleInFirestore(
   article: Omit<ExtendedArticleData, 'id'>
 ): Promise<string> {
   try {
-    const articlesRef = collection(db, ARTICLES_COLLECTION);
+    const collectionName = collectionForArticle(article);
+    const articlesRef = collection(db, collectionName);
     const cleaned = sanitizeForFirestore({
-      ...article,
+      ...readerPayload(article, collectionName),
       createdAt: Date.now(),
       status: article.status || 'Live',
     });
@@ -399,20 +865,48 @@ export async function createArticleInFirestore(
 
 export async function publishArticle(article: Partial<ExtendedArticleData> & { id?: string; title: string }): Promise<string> {
   try {
-    const articlesRef = collection(db, ARTICLES_COLLECTION);
+    const collectionName = collectionForArticle(article);
+    const articlesRef = collection(db, collectionName);
     const targetId = article.id || `story-${Date.now()}`;
-    const { id, ...data } = article;
+    const data = readerPayload(article, collectionName);
     const cleaned = sanitizeForFirestore({
       ...data,
-      id: targetId,
       createdAt: data.createdAt || Date.now(),
       status: data.status || 'Live',
     });
-    await setDoc(doc(articlesRef, targetId), cleaned, { merge: true });
+    if (activeDatabaseMode === 'local') {
+      await localDatabaseRequest(`/api/content/${collectionName}/${targetId}`, {
+        method: 'PUT',
+        body: JSON.stringify(cleaned),
+      });
+      return targetId;
+    }
+    await withFirestoreTimeout(
+      setDoc(doc(articlesRef, targetId), cleaned, { merge: true }),
+      'Publishing to Firestore timed out after 15 seconds',
+    );
     return targetId;
   } catch (err) {
     console.error('Error publishing article to Firestore:', err);
     throw err;
+  }
+}
+
+async function withFirestoreTimeout<T>(
+  operation: Promise<T>,
+  message: string,
+  timeoutMs = FIRESTORE_WRITE_TIMEOUT_MS,
+): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
 }
 
@@ -422,9 +916,24 @@ export async function updateArticleInFirestore(
   updates: Partial<ExtendedArticleData>
 ): Promise<void> {
   try {
-    const docRef = doc(db, ARTICLES_COLLECTION, id);
+    if (activeDatabaseMode === 'local') {
+      const location = await findLocalArticleLocation(id);
+      if (!location) throw new Error(`Article ${id} was not found`);
+      const cleaned = sanitizeForFirestore({
+        ...readerPayload({ ...location.data, ...updates, title: updates.title || location.data.title || '' }, location.collectionName),
+        updatedAt: Date.now(),
+      });
+      await localDatabaseRequest(`/api/content/${location.collectionName}/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...location.data, ...cleaned }),
+      });
+      return;
+    }
+    const location = await findArticleLocation(id);
+    if (!location) throw new Error(`Article ${id} was not found`);
+    const docRef = doc(db, location.collectionName, id);
     const cleaned = sanitizeForFirestore({
-      ...updates,
+      ...readerPayload({ ...location.data, ...updates, title: updates.title || location.data.title || '' }, location.collectionName),
       updatedAt: Date.now(),
     });
     await updateDoc(docRef, cleaned);
@@ -439,12 +948,47 @@ export const updateArticle = updateArticleInFirestore;
 // Delete article from Firestore
 export async function deleteArticleFromFirestore(id: string): Promise<void> {
   try {
-    const docRef = doc(db, ARTICLES_COLLECTION, id);
+    if (activeDatabaseMode === 'local') {
+      const location = await findLocalArticleLocation(id);
+      if (!location) throw new Error(`Article ${id} was not found`);
+      await localDatabaseRequest(`/api/content/${location.collectionName}/${id}`, { method: 'DELETE' });
+      return;
+    }
+    const location = await findArticleLocation(id);
+    if (!location) throw new Error(`Article ${id} was not found`);
+    const docRef = doc(db, location.collectionName, id);
     await deleteDoc(docRef);
   } catch (err) {
     console.error('Error deleting article from Firestore:', err);
     throw err;
   }
+}
+
+async function findLocalArticleLocation(id: string): Promise<{
+  collectionName: ContentCollection;
+  data: Record<string, any>;
+} | null> {
+  const payload = await localDatabaseRequest<{
+    items: Array<{ id: string; collection: ContentCollection; data: Record<string, any> }>;
+  }>('/api/content?collections=' + CONTENT_COLLECTIONS.join(','));
+  const found = payload.items.find((item) => item.id === id);
+  return found ? { collectionName: found.collection, data: found.data } : null;
+}
+
+async function findArticleLocation(id: string): Promise<{
+  collectionName: ContentCollection;
+  data: Record<string, any>;
+} | null> {
+  const snapshots = await Promise.all(
+    CONTENT_COLLECTIONS.map(async (collectionName) => ({
+      collectionName,
+      snapshot: await getDoc(doc(db, collectionName, id)),
+    })),
+  );
+  const found = snapshots.find(({ snapshot }) => snapshot.exists());
+  return found
+    ? { collectionName: found.collectionName, data: found.snapshot.data() || {} }
+    : null;
 }
 
 export const deleteArticle = deleteArticleFromFirestore;
@@ -455,12 +999,14 @@ export async function votePollInFirestore(
   optionId: string
 ): Promise<void> {
   try {
-    const docRef = doc(db, ARTICLES_COLLECTION, articleId);
-    const docSnap = await getDoc(docRef);
-    if (docSnap.exists()) {
+    const location = await findArticleLocation(articleId);
+    if (location) {
+      const docRef = doc(db, location.collectionName, articleId);
+      const docSnap = await getDoc(docRef);
       const data = docSnap.data();
-      if (data.pollOptions) {
-        const updatedOptions = data.pollOptions.map((opt: any) => {
+      const existingOptions = data?.options || data?.pollOptions;
+      if (existingOptions) {
+        const updatedOptions = existingOptions.map((opt: any) => {
           if (opt.id === optionId) {
             return { ...opt, votes: (opt.votes || 0) + 1 };
           }
@@ -468,8 +1014,8 @@ export async function votePollInFirestore(
         });
         const totalVotes = updatedOptions.reduce((acc: number, curr: any) => acc + (curr.votes || 0), 0);
         await updateDoc(docRef, {
-          pollOptions: updatedOptions,
-          totalVotes,
+          options: updatedOptions,
+          votes: totalVotes,
         });
       }
     }
@@ -480,22 +1026,30 @@ export async function votePollInFirestore(
 
 // Subscribe to global app settings in Firestore
 export function subscribeToAppSettings(
-  onData: (settings: { reelsEnabled: boolean }) => void
+  onData: (settings: AppSettings) => void
 ) {
   try {
     const docRef = doc(db, SETTINGS_COLLECTION, 'global');
     return onSnapshot(docRef, (docSnap) => {
       if (docSnap.exists()) {
-        onData(docSnap.data() as { reelsEnabled: boolean });
+        const data = docSnap.data();
+        onData({
+          reelsEnabled: data.reelsEnabled === true,
+          databaseMode: data.databaseMode === 'local' ? 'local' : 'firebase',
+        });
       } else {
         // Default settings
-        setDoc(docRef, { reelsEnabled: false, siteName: 'FlickPulse / MSTUDI' });
-        onData({ reelsEnabled: false });
+        setDoc(docRef, {
+          reelsEnabled: false,
+          databaseMode: 'firebase',
+          siteName: 'FlickPulse / MSTUDI',
+        });
+        onData({ reelsEnabled: false, databaseMode: 'firebase' });
       }
     });
   } catch (err) {
     console.warn('AppSettings subscribe error:', err);
-    onData({ reelsEnabled: false });
+    onData({ reelsEnabled: false, databaseMode: 'firebase' });
     return () => {};
   }
 }
@@ -507,9 +1061,10 @@ export async function submitReaderAnswerToFirestore(
   userName: string = 'Verified Reader'
 ): Promise<void> {
   try {
-    const docRef = doc(db, ARTICLES_COLLECTION, articleId);
-    const docSnap = await getDoc(docRef);
-    if (docSnap.exists()) {
+    const location = await findArticleLocation(articleId);
+    if (location) {
+      const docRef = doc(db, location.collectionName, articleId);
+      const docSnap = await getDoc(docRef);
       const data = docSnap.data();
       const existingAnswers: ReaderAnswerItem[] = data.readerAnswers || [];
       const newAnswer: ReaderAnswerItem = {
@@ -539,6 +1094,16 @@ export async function toggleReelsInFirestore(enabled: boolean): Promise<void> {
   }
 }
 
+export async function setDatabaseModeInFirestore(mode: DatabaseMode): Promise<void> {
+  try {
+    const docRef = doc(db, SETTINGS_COLLECTION, 'global');
+    await setDoc(docRef, { databaseMode: mode }, { merge: true });
+  } catch (err) {
+    console.error('Error changing database mode in Firestore:', err);
+    throw err;
+  }
+}
+
 // Submit user movie review / feedback to Firestore
 export async function submitMovieReviewToFirestore(
   articleId: string,
@@ -551,8 +1116,9 @@ export async function submitMovieReviewToFirestore(
   }
 ): Promise<MovieFeedbackItem> {
   try {
-    const docRef = doc(db, ARTICLES_COLLECTION, articleId);
-    const docSnap = await getDoc(docRef);
+    const location = await findArticleLocation(articleId);
+    const docRef = location ? doc(db, location.collectionName, articleId) : null;
+    const docSnap = docRef ? await getDoc(docRef) : null;
     const newFeedback: MovieFeedbackItem = {
       id: `rev-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       author: review.author || 'Verified Viewer',
@@ -564,7 +1130,7 @@ export async function submitMovieReviewToFirestore(
       timestamp: Date.now(),
     };
 
-    if (docSnap.exists()) {
+    if (docSnap?.exists() && docRef) {
       const data = docSnap.data();
       const existingReviews: MovieFeedbackItem[] = data.audienceReviews || [];
       const totalRatingsCount = (Number(data.audienceRatingsCount) || 14200) + 1;
@@ -610,9 +1176,10 @@ export async function rateMovieInFirestore(
   userScore: number
 ): Promise<{ newRating: string; totalVotes: number }> {
   try {
-    const docRef = doc(db, ARTICLES_COLLECTION, articleId);
-    const docSnap = await getDoc(docRef);
-    if (docSnap.exists()) {
+    const location = await findArticleLocation(articleId);
+    const docRef = location ? doc(db, location.collectionName, articleId) : null;
+    const docSnap = docRef ? await getDoc(docRef) : null;
+    if (docSnap?.exists() && docRef) {
       const data = docSnap.data();
       const currentCount = Number(data.audienceRatingsCount) || 14280;
       const currentRating = Number(data.starRating || (typeof data.rating === 'string' && parseFloat(data.rating)) || 8.6);

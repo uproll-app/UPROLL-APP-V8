@@ -1,0 +1,27 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isEditorialUser() {
+      return signedIn() && (
+        request.auth.token.role == 'admin' ||
+        request.auth.token.role == 'editor' ||
+        request.auth.token.role == 'writer'
+      );
+    }
+
+    match /content-videos/{fileName} {
+      allow read: if true;
+      allow write: if isEditorialUser();
+    }
+
+    match /content-images/{articleId}/{fileName} {
+      allow read: if true;
+      allow write: if isEditorialUser();
+    }
+  }
+}

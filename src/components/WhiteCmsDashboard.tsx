@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   LayoutDashboard,
+  LayoutGrid,
   FileText,
   Database,
   Layers,
@@ -53,7 +54,6 @@ import {
   Hash,
   RotateCcw,
   FileCheck,
-  DollarSign,
   Megaphone,
   BadgePercent,
   ExternalLink,
@@ -67,6 +67,8 @@ import {
   ArrowUpDown
 } from 'lucide-react';
 import { LiveMobileEmulator } from './LiveMobileEmulator';
+import { CrawlingSection, QueueItem } from './CrawlingSection';
+import { auth } from '../lib/firebase';
 import {
   ExtendedArticleData,
   subscribeToArticles,
@@ -75,9 +77,18 @@ import {
   deleteArticleFromFirestore,
   votePollInFirestore,
   submitReaderAnswerToFirestore,
-  seedArticlesIfEmpty,
-  INITIAL_SEED_ARTICLES,
-  ReaderAnswerItem
+  uploadVideoFile,
+  uploadImageDataUrl,
+  uploadImageDataUrls,
+  ReaderAnswerItem,
+  subscribeToInteractionStats,
+  InteractionStats,
+  subscribeToAppSettings,
+  setDatabaseModeInFirestore,
+  DatabaseMode,
+  setActiveDatabaseMode,
+  migrateFirebaseToLocalDatabase,
+  setLocalDatabaseMode,
 } from '../lib/newsService';
 
 interface WhiteCmsDashboardProps {
@@ -85,34 +96,27 @@ interface WhiteCmsDashboardProps {
   onSelectArticleForReader?: (articleId: string) => void;
 }
 
-export type NavSection = 'overview' | 'article_creator' | 'monetization' | 'data_hub' | 'article_manager' | 'settings';
+export type NavSection = 'overview' | 'article_creator' | 'crawling' | 'drafts' | 'monetization' | 'data_hub' | 'article_manager' | 'settings';
 export type ArticleFormatTab = 'standard' | 'poll' | 'gallery' | 'full_gallery' | 'ask_reader' | 'movie_review';
-export type DataHubSubTab = 'polls' | 'ask_readers';
+export type DataHubSubTab = 'polls' | 'ratings' | 'ask_readers';
 
 export interface NavMenuItem {
   id: NavSection;
   label: string;
   badge?: string;
-  iconName: 'LayoutDashboard' | 'FileText' | 'DollarSign' | 'Database' | 'Layers' | 'Settings';
+  iconName: 'LayoutDashboard' | 'FileText' | 'Globe' | 'Megaphone' | 'Database' | 'Layers' | 'Settings';
   description: string;
 }
 
 export const DEFAULT_MENU_ITEMS: NavMenuItem[] = [
   { id: 'overview', label: 'Overview', iconName: 'LayoutDashboard', description: 'Editorial overview & traffic metrics' },
   { id: 'article_creator', label: 'Create / Edit Article', iconName: 'FileText', description: 'Interactive story editor' },
-  { id: 'monetization', label: 'Monetization & Ads', iconName: 'DollarSign', badge: 'New', description: 'Brand stories, links & ads' },
+    { id: 'crawling', label: 'Crawling & Writer Queue', iconName: 'Globe', description: 'Portal sources and fact-check queue' },
+    { id: 'drafts', label: 'Drafts', iconName: 'FileText', description: 'Claimed writer drafts' },
+  { id: 'monetization', label: 'Sponsored Content', iconName: 'Megaphone', badge: 'New', description: 'Brand stories, links & campaigns' },
   { id: 'data_hub', label: 'Data Hub', iconName: 'Database', description: 'Reader polls & answers' },
   { id: 'article_manager', label: 'Article Manager', iconName: 'Layers', description: 'Content list & filters' },
   { id: 'settings', label: 'Settings', iconName: 'Settings', description: 'System configuration' },
-];
-
-const PRESET_IMAGES = [
-  { label: 'Cinema Hall', url: 'https://images.unsplash.com/photo-1517604931442-7e0c8ed2963c?q=80&w=1000&auto=format&fit=crop' },
-  { label: 'Film Projector', url: 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?q=80&w=1000&auto=format&fit=crop' },
-  { label: 'Studio Camera', url: 'https://images.unsplash.com/photo-1485846234645-a62644f84728?q=80&w=1000&auto=format&fit=crop' },
-  { label: 'Red Carpet Gala', url: 'https://images.unsplash.com/photo-1536440136628-849c177e76a1?q=80&w=1000&auto=format&fit=crop' },
-  { label: 'Celebrity Spotlight', url: 'https://images.unsplash.com/photo-1541872703-74c5e44368f9?q=80&w=1000&auto=format&fit=crop' },
-  { label: 'Movie Theater', url: 'https://images.unsplash.com/photo-1478720568477-152d9b164e26?q=80&w=1000&auto=format&fit=crop' },
 ];
 
 const DEFAULT_CATEGORIES = [
@@ -140,6 +144,13 @@ export function generateStoryId(): string {
   const rand = Math.floor(1000 + Math.random() * 9000);
   return `#${rand}`;
 }
+
+const createDefaultPollOptions = () => [
+  { id: '1', text: '', votes: 0, isCorrect: false },
+  { id: '2', text: '', votes: 0, isCorrect: false },
+];
+
+const DATABASE_SWITCH_PASSWORD = (import.meta.env.VITE_DATABASE_SWITCH_PASSWORD as string | undefined) || 'uproll-admin';
 
 export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader }: WhiteCmsDashboardProps) {
   // User Role & Permissions State (Admin vs Editor)
@@ -186,6 +197,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
   const [articles, setArticles] = useState<ExtendedArticleData[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [interactionStats, setInteractionStats] = useState<Record<string, InteractionStats>>({});
 
   // Article Manager filters & search
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -204,14 +216,16 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
   const [formAuthor, setFormAuthor] = useState<string>('UPROLL Editorial Desk');
   const [formStatus, setFormStatus] = useState<'Live' | 'Draft'>('Live');
   const [formIsPinned, setFormIsPinned] = useState<boolean>(false);
+  const [formAttachedToStoryId, setFormAttachedToStoryId] = useState<string>('');
 
   // Media Section state: Raw Image, Raw Video, YouTube Link, Preset
   const [mediaType, setMediaType] = useState<'image' | 'video' | 'youtube'>('image');
-  const [formFeatureImage, setFormFeatureImage] = useState<string>(PRESET_IMAGES[0].url);
+  const [formFeatureImage, setFormFeatureImage] = useState<string>('');
+  const [isImageProcessing, setIsImageProcessing] = useState<boolean>(false);
   const [rawImageFile, setRawImageFile] = useState<File | null>(null);
   const [rawVideoFile, setRawVideoFile] = useState<File | null>(null);
   const [rawVideoUrl, setRawVideoUrl] = useState<string>('');
-  const [youtubeUrl, setYoutubeUrl] = useState<string>('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  const [youtubeUrl, setYoutubeUrl] = useState<string>('');
 
   // CRITICAL: Push Notification Safety - MUST BE FALSE/DISABLED BY DEFAULT
   const [formSendPush, setFormSendPush] = useState<boolean>(false);
@@ -221,19 +235,12 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
 
   // Specific format fields
   // Poll / Quiz
-  const [pollOptions, setPollOptions] = useState<Array<{ id: string; text: string; votes?: number; isCorrect?: boolean }>>([
-    { id: '1', text: 'Option A', votes: 120, isCorrect: true },
-    { id: '2', text: 'Option B', votes: 85, isCorrect: false },
-    { id: '3', text: 'Option C', votes: 45, isCorrect: false },
-  ]);
+  const [pollOptions, setPollOptions] = useState<Array<{ id: string; text: string; votes?: number; isCorrect?: boolean }>>(createDefaultPollOptions);
   const [quizExplanation, setQuizExplanation] = useState<string>('');
 
   // Gallery
-  const [galleryImages, setGalleryImages] = useState<string[]>([
-    'https://images.unsplash.com/photo-1519741497674-611481863552?q=80&w=1000&auto=format&fit=crop',
-    'https://images.unsplash.com/photo-1469371670807-013ccf25f16a?q=80&w=1000&auto=format&fit=crop',
-  ]);
-  const [photoCredit, setPhotoCredit] = useState<string>('Official Press Release');
+  const [galleryImages, setGalleryImages] = useState<string[]>([]);
+  const [photoCredit, setPhotoCredit] = useState<string>('');
   const [formHeaderOverlay, setFormHeaderOverlay] = useState<boolean>(true);
 
   // Ask Reader
@@ -241,17 +248,27 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
   const [allowOpenResponses, setAllowOpenResponses] = useState<boolean>(true);
 
   // Movie Review Specs
-  const [movieDirector, setMovieDirector] = useState<string>('Vysakh');
-  const [movieCast, setMovieCast] = useState<string>('Unni Mukundan, Siddique, Lena');
-  const [movieMusicDirector, setMovieMusicDirector] = useState<string>('Jakes Bejoy');
-  const [movieCinematography, setMovieCinematography] = useState<string>('Shaji Kumar');
-  const [movieRuntime, setMovieRuntime] = useState<string>('2h 30m');
-  const [movieYear, setMovieYear] = useState<string>('2026');
-  const [movieCertificate, setMovieCertificate] = useState<string>('U/A 16+');
-  const [movieVerdict, setMovieVerdict] = useState<string>('MUST WATCH');
-  const [movieStarRating, setMovieStarRating] = useState<string>('8.6');
-  const [moviePros, setMoviePros] = useState<string>('High octane action sequences, electrifying BGM');
-  const [movieCons, setMovieCons] = useState<string>('Slightly stretched middle act');
+  const [movieDirector, setMovieDirector] = useState<string>('');
+  const [movieCast, setMovieCast] = useState<string>('');
+  const [movieCastMembers, setMovieCastMembers] = useState<Array<{ name: string; characterName: string; imageUrl: string }>>([]);
+  const [movieSynopsis, setMovieSynopsis] = useState<string>('');
+  const [movieGenres, setMovieGenres] = useState<string[]>(['', '', '', '']);
+  const [movieReleaseDate, setMovieReleaseDate] = useState<string>('');
+  const [movieReleaseStatus, setMovieReleaseStatus] = useState<'Released' | 'Not yet released'>('Released');
+  const [movieCountry, setMovieCountry] = useState<string>('India');
+  const [movieLanguage, setMovieLanguage] = useState<string[]>(['Malayalam']);
+  const [movieProductionCompany, setMovieProductionCompany] = useState<string>('');
+  const [movieRelatedImages, setMovieRelatedImages] = useState<string[]>([]);
+  const [movieRelatedImageLink, setMovieRelatedImageLink] = useState<string>('');
+  const [movieMusicDirector, setMovieMusicDirector] = useState<string>('');
+  const [movieCinematography, setMovieCinematography] = useState<string>('');
+  const [movieRuntime, setMovieRuntime] = useState<string>('');
+  const [movieYear, setMovieYear] = useState<string>('');
+  const [movieCertificate, setMovieCertificate] = useState<string>('');
+  const [movieVerdict, setMovieVerdict] = useState<string>('');
+  const [movieStarRating, setMovieStarRating] = useState<string>('');
+  const [moviePros, setMoviePros] = useState<string>('');
+  const [movieCons, setMovieCons] = useState<string>('');
 
   // Settings State - Synced with LocalStorage
   const [categoriesList, setCategoriesList] = useState<string[]>(DEFAULT_CATEGORIES);
@@ -266,17 +283,13 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     }
   });
   const [defaultAuthor, setDefaultAuthor] = useState<string>('UPROLL Editorial Desk');
+  const [databaseMode, setDatabaseMode] = useState<DatabaseMode>('firebase');
+  const [isDatabaseModeSaving, setIsDatabaseModeSaving] = useState<boolean>(false);
+  const [showDatabasePasswordModal, setShowDatabasePasswordModal] = useState<boolean>(false);
+  const [pendingDatabaseMode, setPendingDatabaseMode] = useState<DatabaseMode | null>(null);
+  const [databaseModePassword, setDatabaseModePassword] = useState<string>('');
+  const [databaseModePasswordError, setDatabaseModePasswordError] = useState<string>('');
 
-  // Monetization & Ads Settings State
-  const [adMobEnabled, setAdMobEnabled] = useState<boolean>(true);
-  const [adMobAppId, setAdMobAppId] = useState<string>('ca-app-pub-3940256099942544~3347511713');
-  const [nativeAdUnitId, setNativeAdUnitId] = useState<string>('ca-app-pub-3940256099942544/2247696110');
-  const [nativeAdFrequency, setNativeAdFrequency] = useState<number>(5);
-  const [interstitialEnabled, setInterstitialEnabled] = useState<boolean>(true);
-  const [interstitialAdUnitId, setInterstitialAdUnitId] = useState<string>('ca-app-pub-3940256099942544/1033173712');
-  const [interstitialFrequency, setInterstitialFrequency] = useState<number>(10);
-  const [affiliateBmsId, setAffiliateBmsId] = useState<string>('UPROLL_BMS_AFF_2026');
-  const [affiliateOttId, setAffiliateOttId] = useState<string>('UPROLL_STREAMING_PARTNER');
   const [directSponsors, setDirectSponsors] = useState<Array<{
     id: string;
     brand: string;
@@ -288,54 +301,24 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     clicks: number;
     active: boolean;
     tag: string;
-  }>>([
-    {
-      id: 'sp-1',
-      brand: 'Kalyan Silks Fest',
-      headline: 'Special Onam Traditional Cinema Wardrobe Collection',
-      ctaText: 'Shop Exclusive Offer',
-      ctaUrl: 'https://example.com/kalyansilks',
-      imageUrl: 'https://images.unsplash.com/photo-1610030469983-98e550d6193c?q=80&w=1000&auto=format&fit=crop',
-      impressions: 18450,
-      clicks: 1240,
-      active: true,
-      tag: 'Brand Sponsor',
-    },
-    {
-      id: 'sp-2',
-      brand: 'PVR INOX Passport',
-      headline: 'Watch 10 Malayalam Blockbusters at Flat 40% Off',
-      ctaText: 'Claim Movie Pass',
-      ctaUrl: 'https://example.com/pvrpass',
-      imageUrl: 'https://images.unsplash.com/photo-1517604931442-7e0c8ed2963c?q=80&w=1000&auto=format&fit=crop',
-      impressions: 12300,
-      clicks: 890,
-      active: true,
-      tag: 'Cinema Partner',
-    }
-  ]);
+  }>>([]);
   const [newSponsorBrand, setNewSponsorBrand] = useState<string>('');
   const [newSponsorHeadline, setNewSponsorHeadline] = useState<string>('');
-  const [newSponsorCtaText, setNewSponsorCtaText] = useState<string>('Book Now');
-  const [newSponsorCtaUrl, setNewSponsorCtaUrl] = useState<string>('https://');
-  const [newSponsorImage, setNewSponsorImage] = useState<string>(PRESET_IMAGES[0].url);
+  const [newSponsorCtaText, setNewSponsorCtaText] = useState<string>('');
+  const [newSponsorCtaUrl, setNewSponsorCtaUrl] = useState<string>('');
+  const [newSponsorImage, setNewSponsorImage] = useState<string>('');
 
   // Monetization Article Creator State (Full Gallery, Standard Story, Gallery Carousel)
   const [monetizeFormatTab, setMonetizeFormatTab] = useState<'full_gallery' | 'standard' | 'gallery'>('full_gallery');
-  const [monetizeBrand, setMonetizeBrand] = useState<string>('Joyalukkas');
-  const [monetizeHeadline, setMonetizeHeadline] = useState<string>('Joyalukkas Diamond Fest 2026: 10 Exclusive Looks & High Jewellery Showcase');
-  const [monetizeCategory, setMonetizeCategory] = useState<string>('Brand Spotlight');
-  const [monetizeSummary, setMonetizeSummary] = useState<string>('Explore Joyalukkas Diamond Fest 2026 featuring handcrafted VVS solitaire diamond necklaces and bridal sets with guaranteed lifetime exchange.');
-  const [monetizeFullContent, setMonetizeFullContent] = useState<string>('Joyalukkas proudly presents its flagship Diamond Celebration across all premier showrooms. Featuring certified natural diamonds crafted by master artisans with lifetime exchange assurance.');
-  const [monetizeCtaLabel, setMonetizeCtaLabel] = useState<string>('Shop Diamond Fest 2026');
-  const [monetizeLandingUrl, setMonetizeLandingUrl] = useState<string>('https://www.joyalukkas.com');
-  const [monetizeFeatureImage, setMonetizeFeatureImage] = useState<string>(PRESET_IMAGES[0].url);
-  const [monetizeGalleryImages, setMonetizeGalleryImages] = useState<string[]>([
-    'https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?q=80&w=1000&auto=format&fit=crop',
-    'https://images.unsplash.com/photo-1599643478518-a784e5dc4c8f?q=80&w=1000&auto=format&fit=crop',
-    'https://images.unsplash.com/photo-1605100804763-247f67b3557e?q=80&w=1000&auto=format&fit=crop',
-    'https://images.unsplash.com/photo-1535632066927-ab7c9ab60908?q=80&w=1000&auto=format&fit=crop',
-  ]);
+  const [monetizeBrand, setMonetizeBrand] = useState<string>('');
+  const [monetizeHeadline, setMonetizeHeadline] = useState<string>('');
+  const [monetizeCategory, setMonetizeCategory] = useState<string>('');
+  const [monetizeSummary, setMonetizeSummary] = useState<string>('');
+  const [monetizeFullContent, setMonetizeFullContent] = useState<string>('');
+  const [monetizeCtaLabel, setMonetizeCtaLabel] = useState<string>('');
+  const [monetizeLandingUrl, setMonetizeLandingUrl] = useState<string>('');
+  const [monetizeFeatureImage, setMonetizeFeatureImage] = useState<string>('');
+  const [monetizeGalleryImages, setMonetizeGalleryImages] = useState<string[]>([]);
   const [monetizeSendPush, setMonetizeSendPush] = useState<boolean>(false);
   const [monetizeIsSaving, setMonetizeIsSaving] = useState<boolean>(false);
   const [editingMonetizeArticleId, setEditingMonetizeArticleId] = useState<string | null>(null);
@@ -468,7 +451,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
       // Save to Firestore
       if (editingMonetizeArticleId) {
         await updateArticleInFirestore(generatedId, payload);
-        showToast(`Updated "${monetizeHeadline.slice(0, 25)}..." in Firestore`);
+        showToast(`Updated "${monetizeHeadline.slice(0, 25)}..." in ${databaseMode === 'local' ? 'local database' : 'Firebase'}`);
       } else {
         await publishArticle(payload);
         showToast(`Published sponsored ${monetizeFormatTab === 'full_gallery' ? 'Full Image Gallery' : monetizeFormatTab === 'gallery' ? 'Gallery Slider' : 'Standard Story'} with landing back-link!`);
@@ -477,7 +460,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
       setEditingMonetizeArticleId(null);
     } catch (err) {
       console.error('Error publishing monetized article:', err);
-      showToast('Saved locally in real-time');
+      showToast(`Publish failed: ${err instanceof Error ? err.message : `${databaseMode === 'local' ? 'Local database' : 'Firebase'} request failed`}`);
     } finally {
       setMonetizeIsSaving(false);
     }
@@ -514,13 +497,13 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     setMonetizeRawImageFile(null);
     setMonetizeBrand('');
     setMonetizeHeadline('');
-    setMonetizeCategory('Brand Spotlight');
+    setMonetizeCategory('');
     setMonetizeSummary('');
     setMonetizeFullContent('');
-    setMonetizeCtaLabel('Visit Brand Page');
-    setMonetizeLandingUrl('https://');
-    setMonetizeFeatureImage(PRESET_IMAGES[0].url);
-    setMonetizeGalleryImages([PRESET_IMAGES[0].url, PRESET_IMAGES[1].url]);
+    setMonetizeCtaLabel('');
+    setMonetizeLandingUrl('');
+    setMonetizeFeatureImage('');
+    setMonetizeGalleryImages([]);
     setMonetizeSendPush(false);
     showToast('Cleared Monetization Creator form');
   };
@@ -564,6 +547,48 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     }
   };
 
+  const handleMovieRelatedImagesUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files?.length) return;
+    const remainingSlots = Math.max(0, 10 - movieRelatedImages.length);
+    const fileList = (Array.from(files) as File[]).slice(0, remainingSlots);
+    const readers = fileList.map((file) => new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.readAsDataURL(file);
+    }));
+    Promise.all(readers).then((newUrls) => {
+      setMovieRelatedImages((prev) => [...prev, ...newUrls].filter(Boolean).slice(0, 10));
+      showToast(`Added ${newUrls.length} related image(s) (Max 10)`);
+    });
+  };
+
+  const handleMovieCastImageUpload = (
+    index: number,
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setMovieCastMembers((prev) =>
+        prev.map((member, memberIndex) =>
+          memberIndex === index
+            ? { ...member, imageUrl: String(reader.result || '') }
+            : member,
+        ),
+      );
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const addMovieRelatedImageLink = () => {
+    const link = movieRelatedImageLink.trim();
+    if (!link || movieRelatedImages.length >= 10) return;
+    setMovieRelatedImages((prev) => [...prev, link].slice(0, 10));
+    setMovieRelatedImageLink('');
+  };
+
   // Answer Submission simulator for Data Hub
   const [simulatedAnswer, setSimulatedAnswer] = useState<string>('');
   const [selectedAskArticleId, setSelectedAskArticleId] = useState<string>('');
@@ -591,12 +616,28 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
+  useEffect(() => {
+    const unsubscribe = subscribeToInteractionStats(
+      setInteractionStats,
+      (error) => console.warn('Interaction data subscription error:', error),
+    );
+    return () => unsubscribe();
+  }, []);
+
   // Subscribe to real-time articles
   useEffect(() => {
     setIsLoading(true);
     const unsubscribe = subscribeToArticles((data) => {
-      setArticles(data || INITIAL_SEED_ARTICLES);
+      setArticles(data);
       setIsLoading(false);
+    }, (error) => showToast(`Content sync failed: ${error.message}`), databaseMode);
+    return () => unsubscribe();
+  }, [databaseMode]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToAppSettings((settings) => {
+      setDatabaseMode(settings.databaseMode);
+      setActiveDatabaseMode(settings.databaseMode);
     });
     return () => unsubscribe();
   }, []);
@@ -606,15 +647,79 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     setTimeout(() => setToastMessage(null), 4000);
   };
 
+  const handleDatabaseModeChange = async (mode: DatabaseMode) => {
+    if (mode === databaseMode || isDatabaseModeSaving || userRole !== 'admin') return;
+    const previousMode = databaseMode;
+    setDatabaseMode(mode);
+    setIsDatabaseModeSaving(true);
+    try {
+      const migrated = mode === 'local' ? await migrateFirebaseToLocalDatabase() : 0;
+      await setDatabaseModeInFirestore(mode);
+      await setLocalDatabaseMode(mode);
+      setActiveDatabaseMode(mode);
+      showToast(mode === 'local'
+        ? `Local database active. Mirrored ${migrated} Firebase record(s).`
+        : 'Firebase database active.');
+    } catch {
+      setDatabaseMode(previousMode);
+      showToast('Could not save the database mode. Firebase remains active.');
+    } finally {
+      setIsDatabaseModeSaving(false);
+    }
+  };
+
+  const requestDatabaseModeChange = (mode: DatabaseMode) => {
+    if (mode === databaseMode || isDatabaseModeSaving || userRole !== 'admin') return;
+    setPendingDatabaseMode(mode);
+    setDatabaseModePassword('');
+    setDatabaseModePasswordError('');
+    setShowDatabasePasswordModal(true);
+  };
+
+  const confirmDatabaseModeChange = async () => {
+    if (!pendingDatabaseMode) return;
+
+    const enteredPassword = databaseModePassword.trim();
+    if (enteredPassword !== DATABASE_SWITCH_PASSWORD) {
+      setDatabaseModePasswordError('Authentication password is incorrect.');
+      return;
+    }
+
+    setShowDatabasePasswordModal(false);
+    setDatabaseModePassword('');
+    setDatabaseModePasswordError('');
+    await handleDatabaseModeChange(pendingDatabaseMode);
+    setPendingDatabaseMode(null);
+  };
+
   // Dynamic Word and Char calculations reflecting standard target (190 chars • 26 words)
   const rawWords = formSummary.trim().split(/\s+/).filter(Boolean);
   const wordCount = rawWords.length;
   const charCount = formSummary.length;
+  const bodyLineCount = formSummary
+    ? formSummary.split(/\r?\n/).length
+    : 0;
+  const bodyHasTooManyLines = bodyLineCount > 11;
   const targetChars = 190;
   const targetWords = 26;
   const isOptimalRange = (charCount >= 140 && charCount <= 190) || (wordCount >= 20 && wordCount <= 28);
   const maxWords = targetWordCount || 26;
   const wordPercentage = Math.min(100, Math.round((wordCount / maxWords) * 100));
+
+  const compressFeaturedImage = async (dataUrl: string): Promise<string> => {
+    const image = new Image();
+    image.src = dataUrl;
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error('Unable to read image'));
+    });
+    const scale = Math.min(1, 800 / Math.max(image.width, image.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.55);
+  };
 
   // Handle Raw Image File Upload
   const handleRawImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -622,11 +727,19 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     if (file) {
       setRawImageFile(file);
       setMediaType('image');
+      setIsImageProcessing(true);
       const reader = new FileReader();
-      reader.onload = (event) => {
-        if (event.target?.result) {
-          setFormFeatureImage(event.target.result as string);
-          showToast(`Image loaded: ${file.name}`);
+      reader.onload = async (event) => {
+        try {
+          if (event.target?.result) {
+            const compressedImage = await compressFeaturedImage(
+              event.target.result as string,
+            );
+            setFormFeatureImage(compressedImage);
+            showToast(`Image loaded: ${file.name}`);
+          }
+        } finally {
+          setIsImageProcessing(false);
         }
       };
       reader.readAsDataURL(file);
@@ -656,10 +769,11 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     setFormCategory(art.category || 'Hot News');
     setFormSummary(art.summary || '');
     setFormFullContent(art.fullContent || '');
-    setFormFeatureImage(art.featureImage || PRESET_IMAGES[0].url);
+    setFormFeatureImage(art.featureImage || '');
     setFormAuthor(art.author || 'UPROLL Editorial Desk');
     setFormStatus(art.status === 'Draft' ? 'Draft' : 'Live');
     setFormIsPinned(art.isPinned || false);
+    setFormAttachedToStoryId(art.attachedToStoryId || '');
     // Push notification is always false/disabled by default even when editing
     setFormSendPush(false);
 
@@ -682,19 +796,48 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
       if (art.galleryImages && art.galleryImages.length > 0) {
         setGalleryImages(art.galleryImages.slice(0, 10));
       }
+    } else if (art.type === 'poll' || art.type === 'quiz') {
+      setArticleFormatTab('poll');
+      setPollOptions(
+        (art.choiceOptions || []).map((option: any, index: number) => ({
+          id: String(option.id || index + 1),
+          text: typeof option === 'string' ? option : option.text || option.label || '',
+          votes: typeof option === 'object' ? option.votes || 0 : 0,
+          isCorrect: art.type === 'quiz' && option.isCorrect === true,
+        })),
+      );
     } else if (art.type === 'movie' || (art.type as string) === 'movie_review') {
       setArticleFormatTab('movie_review');
-      setMovieDirector(art.director || 'Vysakh');
-      setMovieCast(art.cast || 'Unni Mukundan, Siddique, Lena');
-      setMovieMusicDirector(art.musicDirector || 'Jakes Bejoy');
-      setMovieCinematography(art.cinematography || 'Shaji Kumar');
-      setMovieRuntime(art.runtime || art.duration || '2h 30m');
-      setMovieYear(art.year || '2026');
-      setMovieCertificate(art.certificate || 'U/A 16+');
-      setMovieVerdict(art.verdict || 'MUST WATCH');
-      setMovieStarRating(String(art.starRating || (typeof art.rating === 'string' && parseFloat(art.rating)) || '8.6'));
-      setMoviePros(art.positives ? art.positives.join(', ') : 'High octane action sequences, electrifying BGM');
-      setMovieCons(art.negatives ? art.negatives.join(', ') : 'Slightly stretched middle act');
+      setMovieDirector(art.director || '');
+      setMovieCast(art.cast || '');
+      setMovieCastMembers(
+        (art.castMembers && art.castMembers.length > 0
+          ? art.castMembers
+          : (art.cast || '').split(',').filter(Boolean).map((name) => ({ name, imageUrl: '' })))
+          .slice(0, 15).map((member) => ({
+          name: member.name || '',
+          characterName: member.characterName || '',
+          imageUrl: member.imageUrl || '',
+        })),
+      );
+      setMovieSynopsis(art.synopsis || art.summary || '');
+      setMovieGenres([...(art.genres || []), '', '', '', ''].slice(0, 4));
+      setMovieReleaseDate(art.releaseDate || '');
+      setMovieReleaseStatus(art.releaseStatus || 'Released');
+      setMovieCountry(art.country || 'India');
+      setMovieLanguage(Array.isArray(art.language) ? art.language : [art.language || 'Malayalam']);
+      setMovieProductionCompany(art.productionCompany || '');
+      setMovieRelatedImages((art.relatedImages || art.galleryImages || []).slice(0, 10));
+      setMovieRelatedImageLink('');
+      setMovieMusicDirector(art.musicDirector || '');
+      setMovieCinematography(art.cinematography || '');
+      setMovieRuntime(art.runtime || art.duration || '');
+      setMovieYear(art.year || '');
+      setMovieCertificate(art.certificate || '');
+      setMovieVerdict(art.verdict || '');
+      setMovieStarRating(String(art.starRating || (typeof art.rating === 'string' && parseFloat(art.rating)) || ''));
+      setMoviePros(art.positives ? art.positives.join(', ') : '');
+      setMovieCons(art.negatives ? art.negatives.join(', ') : '');
     } else {
       setArticleFormatTab('standard');
     }
@@ -704,42 +847,78 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
   };
 
   const handleResetCreatorForm = () => {
+    if (rawVideoUrl) URL.revokeObjectURL(rawVideoUrl);
     setEditingArticleId(null);
     setFormStoryId(generateStoryId());
     setFormTitle('');
     setFormCategory('Hot News');
     setFormSummary('');
     setFormFullContent('');
-    setFormFeatureImage(PRESET_IMAGES[Math.floor(Math.random() * PRESET_IMAGES.length)].url);
+    setFormFullContent('');
+    setFormFeatureImage('');
     setFormAuthor(defaultAuthor);
     setFormStatus('Live');
     setFormIsPinned(false);
+    setFormAttachedToStoryId('');
     setFormSendPush(false);
     setMediaType('image');
     setRawImageFile(null);
     setRawVideoFile(null);
     setRawVideoUrl('');
-    setPollOptions([
-      { id: '1', text: 'Option A', votes: 0, isCorrect: true },
-      { id: '2', text: 'Option B', votes: 0, isCorrect: false },
-    ]);
-    setGalleryImages([
-      PRESET_IMAGES[0].url,
-      PRESET_IMAGES[1].url,
-    ]);
+    setYoutubeUrl('');
+    if (fileImageInputRef.current) fileImageInputRef.current.value = '';
+    if (fileVideoInputRef.current) fileVideoInputRef.current.value = '';
+    setPollOptions(createDefaultPollOptions());
+    setGalleryImages([]);
     setFormHeaderOverlay(true);
-    setMovieDirector('Vysakh');
-    setMovieCast('Unni Mukundan, Siddique, Lena');
-    setMovieMusicDirector('Jakes Bejoy');
-    setMovieCinematography('Shaji Kumar');
-    setMovieRuntime('2h 30m');
-    setMovieYear('2026');
-    setMovieCertificate('U/A 16+');
-    setMovieVerdict('MUST WATCH');
-    setMovieStarRating('8.6');
-    setMoviePros('High octane action sequences, electrifying BGM');
-    setMovieCons('Slightly stretched middle act');
+    setMovieDirector('');
+    setMovieCast('');
+    setMovieCastMembers([]);
+    setMovieSynopsis('');
+    setMovieGenres(['', '', '', '']);
+    setMovieReleaseDate('');
+    setMovieReleaseStatus('Released');
+    setMovieCountry('India');
+    setMovieLanguage(['Malayalam']);
+    setMovieProductionCompany('');
+    setMovieRelatedImages([]);
+    setMovieRelatedImageLink('');
+    setMovieMusicDirector('');
+    setMovieCinematography('');
+    setMovieRuntime('');
+    setMovieYear('');
+    setMovieCertificate('');
+    setMovieVerdict('');
+    setMovieStarRating('');
+    setMoviePros('');
+    setMovieCons('');
     setQuizExplanation('');
+  };
+
+  const handleOpenCrawledInStudio = (item: QueueItem) => {
+    if (!item.claimedBy) {
+      showToast('Claim this story first, then open it in Story Studio.');
+      return;
+    }
+    if (item.claimedBy !== auth.currentUser?.uid) {
+      showToast('Only the claiming writer can open this story in Story Studio.');
+      return;
+    }
+    setEditingArticleId(null);
+    setFormStoryId(generateStoryId());
+    setFormTitle(item.title || '');
+    setFormCategory('Hot News');
+    setFormSummary(item.summary || item.fullContent || '');
+    setFormFullContent(item.fullContent || item.summary || '');
+    setFormFeatureImage(item.imageUrl || '');
+    setFormAuthor(defaultAuthor);
+    setFormStatus('Draft');
+    setFormIsPinned(false);
+    setFormAttachedToStoryId('');
+    setFormSendPush(false);
+    setMediaType('image');
+    setActiveSection('article_creator');
+    showToast('Crawled story opened as a draft in Story Studio.');
   };
 
   const handleSaveArticle = async (e?: React.FormEvent) => {
@@ -748,8 +927,25 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
       showToast('Please enter an article headline');
       return;
     }
-    if (articleFormatTab !== 'full_gallery' && !formSummary.trim()) {
-      showToast('Please enter a short news card summary');
+    if (
+      articleFormatTab !== 'full_gallery' &&
+      articleFormatTab !== 'gallery' &&
+      articleFormatTab !== 'poll' &&
+      !(articleFormatTab === 'movie_review' ? movieSynopsis.trim() : formSummary.trim())
+    ) {
+      showToast(articleFormatTab === 'movie_review' ? 'Please enter the movie synopsis' : 'Please enter the article body');
+      return;
+    }
+    if (articleFormatTab !== 'poll' && bodyHasTooManyLines) {
+      showToast('Body cannot exceed 11 lines');
+      return;
+    }
+    if (articleFormatTab !== 'poll' && !formFeatureImage.trim()) {
+      showToast(
+        isImageProcessing
+          ? 'Featured image is still processing. Please wait a moment.'
+          : 'Please add a featured image before publishing the story.',
+      );
       return;
     }
 
@@ -763,9 +959,19 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
         storyId: effectiveStoryId,
         title: formTitle.trim(),
         category: formCategory,
-        summary: formSummary.trim() || formTitle.trim(),
-        fullContent: articleFormatTab === 'full_gallery' || articleFormatTab === 'gallery' ? '' : (formFullContent.trim() || formSummary.trim()),
-        featureImage: formFeatureImage,
+        summary:
+          articleFormatTab === 'movie_review'
+            ? movieSynopsis.trim()
+            : articleFormatTab === 'poll'
+            ? ''
+            : formSummary.trim() || formTitle.trim(),
+        fullContent:
+          articleFormatTab === 'movie_review' ||
+          articleFormatTab === 'full_gallery' ||
+          articleFormatTab === 'gallery' ||
+          articleFormatTab === 'poll'
+            ? ''
+              : formFullContent.trim() || formSummary.trim(),
         author: formAuthor.trim() || defaultAuthor,
         status: formStatus,
         isPinned: formIsPinned,
@@ -775,6 +981,27 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
         rating: 'Normal',
         genres: [formCategory],
       };
+      const latestPublishedStory = articles
+        .filter(
+          (article) =>
+            article.type === 'news' &&
+            article.status === 'Live' &&
+            article.id !== generatedId,
+        )
+        .sort(
+          (left, right) =>
+            Number(right.createdAt || right.updatedAt || 0) -
+            Number(left.createdAt || left.updatedAt || 0),
+        )[0];
+      const attachmentStoryId =
+        formAttachedToStoryId || latestPublishedStory?.id || '';
+      const pendingFeatureImage = formFeatureImage.trim().startsWith('data:image/')
+        ? formFeatureImage.trim()
+        : null;
+
+      if (formFeatureImage.trim()) {
+        payload.featureImage = formFeatureImage.trim();
+      }
 
       if (formSendPush) {
         payload.pushSentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -783,35 +1010,109 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
       if (mediaType === 'youtube' && youtubeUrl) {
         payload.redirectTargetUrl = youtubeUrl;
       }
+      if (mediaType === 'video' && rawVideoFile) {
+        payload.videoUrl = await uploadVideoFile(rawVideoFile, generatedId);
+      }
+      const isGalleryFormat =
+        articleFormatTab === 'gallery' || articleFormatTab === 'full_gallery';
+      if (articleFormatTab !== 'poll' && (!isGalleryFormat || galleryImages.length === 0)) {
+        payload.featureImage = pendingFeatureImage || formFeatureImage;
+      }
 
       // Format types
       if (articleFormatTab === 'full_gallery') {
         payload.type = 'full_gallery';
         const validGallery = galleryImages.filter((img) => img && img.trim());
-        payload.galleryImages = (validGallery.length > 0 ? validGallery : [formFeatureImage]).slice(0, 10);
+        const gallerySources = (
+          validGallery.length > 0 ? validGallery : [formFeatureImage]
+        ).slice(0, 10);
+        payload.galleryImages = await uploadImageDataUrls(
+          gallerySources,
+          generatedId,
+        );
+        payload.featureImage = payload.galleryImages[0] || payload.featureImage;
         payload.badgeTag = 'PHOTO GALLERY';
       } else if (articleFormatTab === 'gallery' || galleryImages.length > 0) {
         if (articleFormatTab === 'gallery') {
           payload.type = 'gallery';
           payload.headerOverlay = formHeaderOverlay;
         }
-        payload.galleryImages = galleryImages.filter((img) => img && img.trim()).slice(0, 10);
+        payload.galleryImages = await uploadImageDataUrls(
+          galleryImages.filter((img) => img && img.trim()).slice(0, 10),
+          generatedId,
+        );
+        payload.featureImage = payload.galleryImages[0] || payload.featureImage;
       } else if (articleFormatTab === 'movie_review') {
         payload.type = 'movie';
+        if (attachmentStoryId) payload.attachedToStoryId = attachmentStoryId;
         payload.director = movieDirector;
-        payload.cast = movieCast;
+        payload.cast = movieCastMembers.map((member) => member.name.trim()).filter(Boolean).join(', ');
+        payload.synopsis = movieSynopsis.trim();
+        payload.genres = movieGenres.filter((genre) => genre.trim()).slice(0, 4);
+        payload.releaseDate = movieReleaseDate;
+        payload.releaseStatus = movieReleaseStatus;
+        payload.country = movieCountry;
+        payload.language = movieLanguage;
+        payload.productionCompany = movieProductionCompany;
+        const relatedImageSources = movieRelatedImages
+          .filter((image) => image.trim())
+          .slice(0, 10);
+        const castMembersToUpload = movieCastMembers
+          .map((member, index) => ({ member, index }))
+          .filter(({ member }) => member.name.trim());
+        const [uploadedRelatedImages, uploadedCastMembers] = await Promise.all([
+          uploadImageDataUrls(relatedImageSources, generatedId),
+          Promise.all(
+            castMembersToUpload.map(async ({ member, index }) => ({
+              name: member.name.trim(),
+              characterName: member.characterName.trim(),
+              imageUrl: await uploadImageDataUrl(
+                member.imageUrl.trim(),
+                generatedId,
+                `cast-${index}`,
+              ),
+            })),
+          ),
+        ]);
+        payload.galleryImages = uploadedRelatedImages;
+        payload.relatedImages = uploadedRelatedImages;
+        payload.relatedImageUrls = uploadedRelatedImages;
+        payload.castMembers = uploadedCastMembers.slice(0, 15);
         payload.musicDirector = movieMusicDirector;
         payload.cinematography = movieCinematography;
         payload.runtime = movieRuntime;
         payload.year = movieYear;
         payload.certificate = movieCertificate;
-        payload.verdict = movieVerdict;
-        payload.starRating = parseFloat(movieStarRating) || 8.6;
-        payload.rating = movieStarRating || '8.6';
-        payload.positives = moviePros.split(',').map((s) => s.trim()).filter(Boolean);
-        payload.negatives = movieCons.split(',').map((s) => s.trim()).filter(Boolean);
+      } else if (articleFormatTab === 'poll') {
+        const isQuiz = pollOptions.some(
+          (option) => option.isCorrect && option.text.trim(),
+        );
+        const pollBackgroundImage = pendingFeatureImage
+          ? await uploadImageDataUrl(pendingFeatureImage, generatedId, 'poll-background')
+          : formFeatureImage.trim();
+        payload.type = isQuiz ? 'quiz' : 'poll';
+        if (attachmentStoryId) payload.attachedToStoryId = attachmentStoryId;
+        payload.question = formTitle.trim();
+        payload.featureImage = pollBackgroundImage;
+        payload.pollBackgroundImage = pollBackgroundImage;
+        payload.choiceOptions = pollOptions
+          .filter((option) => option.text.trim())
+          .map((option) => ({
+            id: option.id,
+            text: option.text.trim(),
+            votes: option.votes || 0,
+            isCorrect: option.isCorrect,
+          }));
       } else {
         payload.type = 'news';
+      }
+
+      if (pendingFeatureImage && articleFormatTab !== 'poll') {
+        payload.featureImage = await uploadImageDataUrl(
+          pendingFeatureImage,
+          generatedId,
+          'feature',
+        );
       }
 
       // Optimistic UI state update
@@ -824,13 +1125,13 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
       });
 
       await publishArticle(payload);
-      
+
       // Feedback Toast Notification Matching Specification
-      showToast(`Story Published Successfully! ID: ${effectiveStoryId}`);
+      showToast(`Story published successfully to ${databaseMode === 'local' ? 'local database' : 'Firebase'}. ID: ${effectiveStoryId}`);
       handleResetCreatorForm();
     } catch (err) {
-      console.warn('Firestore publish caught error, retained in local state:', err);
-      showToast(`Story saved to live feed (ID: ${formStoryId || '#Story'})`);
+      console.warn('Database publish caught error, retained in local state:', err);
+      showToast(`Publish failed: ${err instanceof Error ? err.message : `${databaseMode === 'local' ? 'Local database' : 'Firebase'} request failed`}`);
       handleResetCreatorForm();
     } finally {
       setIsSaving(false);
@@ -840,7 +1141,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     if (confirm(`Are you sure you want to delete "${title}"?`)) {
       try {
         await deleteArticleFromFirestore(id);
-        showToast('Story removed from live Firestore database');
+        showToast(`Story removed from ${databaseMode === 'local' ? 'local database' : 'Firebase'}`);
       } catch (err) {
         console.error('Delete failed:', err);
         showToast('Failed to delete story');
@@ -898,6 +1199,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
   
   // Polls & Ask Reader collections for Data Hub
   const pollArticles = articles.filter(a => (a.type === 'quiz' || a.type === 'poll') && a.choiceOptions && a.choiceOptions.length > 0);
+  const reviewArticles = articles.filter(a => a.type === 'movie' || a.type === 'movie_review');
   const askReaderArticles = articles.filter(a => a.category === 'Fan Opinion' || a.category === 'Ask Battles' || a.badgeTag?.includes('ASK'));
 
   // Open Dashboard in New Tab handler
@@ -917,7 +1219,8 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
     switch (iconName) {
       case 'LayoutDashboard': return <LayoutDashboard className={iconClass} />;
       case 'FileText': return <FileText className={iconClass} />;
-      case 'DollarSign': return <DollarSign className={iconClass} />;
+      case 'Globe': return <Globe className={iconClass} />;
+      case 'Megaphone': return <Megaphone className={iconClass} />;
       case 'Database': return <Database className={iconClass} />;
       case 'Layers': return <Layers className={iconClass} />;
       case 'Settings': return <SettingsIcon className={iconClass} />;
@@ -1010,7 +1313,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
   };
 
   return (
-    <div className="w-full h-full flex-1 bg-[#F8FAFC] text-slate-900 flex flex-col antialiased min-h-0 overflow-hidden">
+    <div className="dashboard-shell w-full h-full flex-1 bg-[#F8FAFC] text-slate-900 flex flex-col antialiased min-h-0 overflow-hidden">
       {/* Top Floating Notification Toast */}
       {toastMessage && (
         <div className="fixed top-6 right-6 z-50 flex items-center gap-2.5 px-5 py-3 rounded-2xl bg-emerald-600 text-white font-bold text-sm shadow-2xl animate-fade-in border border-emerald-500">
@@ -1018,70 +1321,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
           <span>{toastMessage}</span>
         </div>
       )}
-
-      {/* Main White-Themed App Header */}
-      <header className="shrink-0 bg-white border-b border-slate-200/90 px-3.5 sm:px-5 py-1.5 sm:py-2 flex items-center justify-between gap-2.5 z-30 shadow-2xs">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-indigo-600 to-indigo-500 flex items-center justify-center text-white font-black text-sm shadow-xs shrink-0">
-            U
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <h1 className="font-extrabold text-sm tracking-tight text-slate-900 truncate">
-                UPROLL Cinema Studio
-              </h1>
-              <span className="px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-bold text-[9px] border border-emerald-200/80 flex items-center gap-1 shrink-0">
-                <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse" />
-                Firestore Realtime
-              </span>
-            </div>
-            <p className="text-[10px] text-slate-500 font-medium truncate hidden sm:block">
-              Content Management Dashboard
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {/* Open in New Tab Button */}
-          <button
-            onClick={handleOpenInNewTab}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[11px] shadow-2xs transition-all cursor-pointer border border-slate-200/80"
-            title="Open CMS Dashboard in a new browser tab"
-          >
-            <ExternalLink className="w-3.5 h-3.5 text-indigo-600" />
-            <span className="hidden sm:inline">Open in New Tab</span>
-          </button>
-
-          {/* Full Screen Toggle Button */}
-          <button
-            onClick={toggleFullscreen}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[11px] shadow-2xs transition-all cursor-pointer border border-slate-200/80"
-            title={isFullScreen ? 'Exit Full Screen' : 'Toggle Full Screen View'}
-          >
-            {isFullScreen ? (
-              <>
-                <Minimize2 className="w-3.5 h-3.5 text-indigo-600" />
-                <span className="hidden sm:inline">Exit Fullscreen</span>
-              </>
-            ) : (
-              <>
-                <Maximize2 className="w-3.5 h-3.5 text-indigo-600" />
-                <span className="hidden sm:inline">Full Screen</span>
-              </>
-            )}
-          </button>
-
-          {/* Launch Mobile Reader */}
-          <button
-            onClick={onOpenMobileReader}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-bold text-[11px] shadow-xs transition-all cursor-pointer active:scale-95"
-          >
-            <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden sm:inline">Launch Mobile Reader</span>
-            <span className="sm:hidden">Reader</span>
-          </button>
-        </div>
-      </header>
 
       {/* Workspace: Sidebar + Content Body */}
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden bg-[#F8FAFC] min-h-0">
@@ -1394,7 +1633,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                       >
                         <div className="flex items-center gap-3 min-w-0">
                           <img
-                            src={art.featureImage || PRESET_IMAGES[0].url}
+                            src={art.featureImage || ''}
                             alt=""
                             className="w-12 h-12 rounded-lg object-cover border border-slate-200 shrink-0"
                             referrerPolicy="no-referrer"
@@ -1431,6 +1670,9 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
           {/* ========================================================================= */}
           {/* 2. ARTICLE CREATOR / EDITOR SECTION (Split-Screen Form + Live Mobile Emulator) */}
           {/* ========================================================================= */}
+          {activeSection === 'crawling' && <CrawlingSection view="queue" onOpenInStudio={handleOpenCrawledInStudio} />}
+          {activeSection === 'drafts' && <CrawlingSection view="drafts" />}
+
           {activeSection === 'article_creator' && (
             <div className="space-y-6 animate-fade-in w-full">
               {/* Creator Studio Top Bar */}
@@ -1558,7 +1800,9 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                     </div>
 
                     {/* 2. Categories & Quick Chips */}
-                    <div className="space-y-2">
+                    {articleFormatTab !== 'gallery' &&
+                    articleFormatTab !== 'full_gallery' && (
+                      <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <label className="block text-xs font-black uppercase tracking-wider text-slate-800">
                           Category & Tags *
@@ -1581,48 +1825,39 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                         ))}
                       </select>
 
-                      {/* Quick 1-Click Category Chips (Strictly 3 Options: Hot News, Developing, Breaking) */}
-                      <div className="flex items-center gap-2 flex-wrap pt-1">
-                        <span className="text-[10px] text-slate-400 font-bold uppercase">Quick Pick:</span>
-                        {[
-                          { name: 'Hot News', icon: '🔥', activeClass: 'bg-rose-500 text-white border-rose-600 shadow-2xs' },
-                          { name: 'Developing', icon: '⚡', activeClass: 'bg-amber-500 text-white border-amber-600 shadow-2xs' },
-                          { name: 'Breaking', icon: '🚨', activeClass: 'bg-red-600 text-white border-red-700 shadow-2xs' },
-                        ].map((item) => {
-                          const isSelected = formCategory === item.name;
-                          return (
-                            <button
-                              key={item.name}
-                              type="button"
-                              onClick={() => setFormCategory(item.name)}
-                              className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer border flex items-center gap-1.5 ${
-                                isSelected
-                                  ? item.activeClass
-                                  : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                              }`}
-                            >
-                              <span>{item.icon}</span>
-                              <span>{item.name}</span>
-                            </button>
-                          );
-                        })}
                       </div>
-                    </div>
+                    )}
 
-                    {/* 3. Feed Card Summary & Full Article Body */}
-                    {articleFormatTab === 'full_gallery' ? (
+                    {/* 3. Article Body */}
+                    {articleFormatTab === 'movie_review' ||
+                    articleFormatTab === 'full_gallery' ||
+                    articleFormatTab === 'gallery' ||
+                    articleFormatTab === 'poll' ? (
                       <div className="p-4 rounded-xl bg-indigo-50/70 border border-indigo-200/80 flex items-center gap-2 text-xs text-indigo-900 font-medium">
                         <Sparkles className="w-4 h-4 text-indigo-600 shrink-0" />
-                        <span><strong>Full Image Gallery Lookbook:</strong> Feed summary and detailed story body are removed for an uninterrupted photo lookbook experience.</span>
+                        <span>
+                          <strong>
+                            {articleFormatTab === 'movie_review'
+                              ? 'Movie review:'
+                              : articleFormatTab === 'poll'
+                              ? 'Poll card:'
+                              : 'Full Image Gallery Lookbook:'}
+                          </strong>{' '}
+                          {articleFormatTab === 'movie_review'
+                            ? 'Body text is removed. Add the synopsis and movie details below.'
+                            : articleFormatTab === 'poll'
+                            ? 'Feed summary and full article body are removed. Configure the heading and voting options below.'
+                            : 'Feed summary and detailed story body are removed for an uninterrupted photo lookbook experience.'}
+                        </span>
                       </div>
                     ) : (
                       <>
-                        {/* Feed Card Summary - Standard Article Target (190 chars limit) */}
+                        {/* Article Body */}
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
                               <label className="block text-xs font-black uppercase tracking-wider text-slate-800">
-                                Feed Card Summary *
+                                Body *
                               </label>
                               <span
                                 className={`text-[10px] font-bold px-2 py-0.5 rounded-full border transition-colors ${
@@ -1631,61 +1866,56 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                                     : 'bg-indigo-50 text-indigo-700 border-indigo-200'
                                 }`}
                               >
-                                Limit: 190 chars
+                                  Article text
                               </span>
                             </div>
                             <span
                               className={`text-xs font-mono font-bold ${
-                                charCount > 175 ? 'text-amber-600' : isOptimalRange ? 'text-emerald-600' : 'text-slate-600'
+                                bodyHasTooManyLines
+                                  ? 'text-rose-600'
+                                  : 'text-slate-600'
                               }`}
                             >
-                              {charCount} / 190 chars • {wordCount} words
+                              {bodyLineCount} / 11 lines • {wordCount} words
                             </span>
                           </div>
 
                           {/* Generous Ergonomic Full-Width Textarea using full area */}
                           <textarea
                             required
-                            rows={4}
-                            maxLength={190}
+                            rows={11}
                             value={formSummary}
                             onChange={(e) => setFormSummary(e.target.value)}
-                            placeholder="Write concise feed card summary in Malayalam (Strict limit: 190 characters)..."
-                            className="w-full min-h-[120px] px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-900 leading-relaxed focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600 transition-all resize-y"
+                            placeholder="Write the article body..."
+                            aria-invalid={bodyHasTooManyLines}
+                            className={`w-full min-h-[120px] px-4 py-3 rounded-xl bg-slate-50 border text-sm text-slate-900 leading-relaxed focus:bg-white focus:outline-none focus:ring-2 transition-all resize-y ${
+                              bodyHasTooManyLines
+                                ? 'border-rose-500 focus:ring-rose-600/20 focus:border-rose-600'
+                                : 'border-slate-200 focus:ring-indigo-600/20 focus:border-indigo-600'
+                            }`}
+                          />
+                          {bodyHasTooManyLines && (
+                            <p className="text-xs font-bold text-rose-600">
+                              Body cannot exceed 11 lines. Remove {bodyLineCount - 11} line{bodyLineCount - 11 === 1 ? '' : 's'} before publishing.
+                            </p>
+                          )}
+                          <label className="block text-xs font-black uppercase tracking-wider text-slate-800">
+                            Detailed Story Content
+                          </label>
+                          <textarea
+                            rows={8}
+                            value={formFullContent}
+                            onChange={(e) => setFormFullContent(e.target.value)}
+                            placeholder="Optional full story shown when readers tap the headline"
+                            className="w-full min-h-[120px] px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-900 leading-relaxed focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600 transition-all resize-y disabled:opacity-50 disabled:cursor-not-allowed"
                           />
                         </div>
 
-                        {/* Full Article Body (No Character Limit) - Omitted for photo galleries */}
-                        {articleFormatTab !== 'gallery' && (
-                          <div className="space-y-1.5">
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <label className="block text-xs font-black uppercase tracking-wider text-slate-800">
-                                  Full Article Body (Revealed on Headline Tap)
-                                </label>
-                                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-                                  No Character Limit
-                                </span>
-                              </div>
-                              <span className="text-[11px] text-slate-400 font-medium">
-                                {formFullContent.split(/\s+/).filter(Boolean).length} words
-                              </span>
-                            </div>
-
-                            {/* Generous Height Full Width Body */}
-                            <textarea
-                              rows={6}
-                              value={formFullContent}
-                              onChange={(e) => setFormFullContent(e.target.value)}
-                              placeholder="Enter comprehensive article story body. Include full paragraphs, cast remarks, background details, quotes, and analysis. This full text is revealed when readers tap the news card headline..."
-                              className="w-full min-h-[180px] px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-900 leading-relaxed focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600 transition-all font-normal"
-                            />
-                          </div>
-                        )}
                       </>
                     )}
 
                     {/* 5. Media Section: Raw Image, Raw Video, YouTube Link, Presets */}
+                    {articleFormatTab !== 'poll' && (
                     <div className="space-y-3 p-4 rounded-xl bg-slate-50/80 border border-slate-200">
                       <div className="flex items-center justify-between">
                         <label className="block text-xs font-black uppercase tracking-wider text-slate-800">
@@ -1764,24 +1994,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                             )}
                           </div>
 
-                          {/* Presets */}
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <span className="text-[10px] text-slate-400 font-bold">Presets:</span>
-                            {PRESET_IMAGES.map((img) => (
-                              <button
-                                key={img.label}
-                                type="button"
-                                onClick={() => setFormFeatureImage(img.url)}
-                                className={`text-[10px] px-2.5 py-1 rounded-md border font-semibold transition-all cursor-pointer ${
-                                  formFeatureImage === img.url
-                                    ? 'bg-indigo-50 text-indigo-700 border-indigo-300 font-bold shadow-2xs'
-                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
-                                }`}
-                              >
-                                {img.label}
-                              </button>
-                            ))}
-                          </div>
                         </div>
                       )}
 
@@ -1845,6 +2057,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                         </div>
                       )}
                     </div>
+                    )}
 
                     {/* 6. Format-Specific Field Blocks */}
                     {articleFormatTab === 'poll' && (
@@ -1857,6 +2070,44 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                           <span className="text-[11px] text-purple-700 font-bold">
                             {pollOptions.length} choices configured
                           </span>
+                        </div>
+
+                        <div className="space-y-2">
+                          <label className="block text-[11px] font-black uppercase tracking-wider text-purple-900">
+                            Poll background image (optional)
+                          </label>
+                          <div className="flex items-center gap-3 flex-wrap">
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={handleRawImageUpload}
+                              className="hidden"
+                              id="poll-background-upload"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => document.getElementById('poll-background-upload')?.click()}
+                              className="px-3 py-2 rounded-lg bg-white border border-purple-200 text-purple-800 hover:bg-purple-50 text-[11px] font-black flex items-center gap-2 cursor-pointer"
+                            >
+                              <Upload className="w-3.5 h-3.5" />
+                              Upload background image
+                            </button>
+                            {formFeatureImage && (
+                              <span className="text-[10px] font-bold text-emerald-700 flex items-center gap-1">
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                Background selected
+                              </span>
+                            )}
+                          </div>
+                          {formFeatureImage && (
+                            <div className="overflow-hidden rounded-xl border border-purple-200 bg-white">
+                              <img
+                                src={formFeatureImage}
+                                alt="Poll background preview"
+                                className="h-20 w-full object-cover"
+                              />
+                            </div>
+                          )}
                         </div>
 
                         <div className="space-y-2">
@@ -1893,34 +2144,9 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                               >
                                 {opt.isCorrect ? '✓ Correct Answer' : 'Set as Correct'}
                               </button>
-                              {pollOptions.length > 2 && (
-                                <button
-                                  type="button"
-                                  onClick={() => setPollOptions(pollOptions.filter((_, i) => i !== idx))}
-                                  className="p-1.5 text-slate-400 hover:text-rose-600 cursor-pointer"
-                                >
-                                  <X className="w-4 h-4" />
-                                </button>
-                              )}
                             </div>
                           ))}
                         </div>
-
-                        {pollOptions.length < 5 && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setPollOptions([
-                                ...pollOptions,
-                                { id: String(pollOptions.length + 1), text: '', votes: 0, isCorrect: false },
-                              ])
-                            }
-                            className="text-xs font-bold text-purple-700 hover:text-purple-900 cursor-pointer flex items-center gap-1 mt-1"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span>Add Another Voting Option</span>
-                          </button>
-                        )}
                       </div>
                     )}
 
@@ -1947,70 +2173,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                           </span>
                         </div>
 
-                        {/* Header Overlay Option for Gallery Articles */}
-                        {articleFormatTab === 'gallery' && (
-                          <div className="p-4 rounded-xl bg-white border border-sky-200 shadow-2xs space-y-2.5">
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <Sliders className="w-4 h-4 text-sky-600" />
-                                <span className="text-xs font-black uppercase tracking-wider text-slate-900">
-                                  Header Overlay Option
-                                </span>
-                              </div>
-                              <span className="text-[10px] font-extrabold uppercase px-2.5 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">
-                                {formHeaderOverlay ? 'Header Overlay: Active' : 'Split Below: Active'}
-                              </span>
-                            </div>
-                            <p className="text-[11px] text-slate-600 leading-snug">
-                              Choose whether the article headline, category badge, and published time are overlaid directly over the photo reel or displayed below the gallery carousel.
-                            </p>
-
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
-                              <button
-                                type="button"
-                                onClick={() => setFormHeaderOverlay(true)}
-                                className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                                  formHeaderOverlay
-                                    ? 'bg-sky-50/90 border-sky-500 ring-2 ring-sky-300 text-slate-900 shadow-2xs'
-                                    : 'bg-white border-slate-200 hover:bg-slate-50 text-slate-600'
-                                }`}
-                              >
-                                <div className="flex items-center justify-between mb-1">
-                                  <span className="text-xs font-black text-slate-900 flex items-center gap-1.5">
-                                    <Sparkles className="w-3.5 h-3.5 text-sky-600" />
-                                    Header Overlay Mode
-                                  </span>
-                                  {formHeaderOverlay && <CheckCircle2 className="w-4 h-4 text-sky-600 fill-sky-100" />}
-                                </div>
-                                <p className="text-[10px] text-slate-500 leading-relaxed">
-                                  Overlays headline, category tag, and summary directly on top of the gallery photos with dark gradient protection for a modern cinematic look.
-                                </p>
-                              </button>
-
-                              <button
-                                type="button"
-                                onClick={() => setFormHeaderOverlay(false)}
-                                className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                                  !formHeaderOverlay
-                                    ? 'bg-sky-50/90 border-sky-500 ring-2 ring-sky-300 text-slate-900 shadow-2xs'
-                                    : 'bg-white border-slate-200 hover:bg-slate-50 text-slate-600'
-                                }`}
-                              >
-                                <div className="flex items-center justify-between mb-1">
-                                  <span className="text-xs font-black text-slate-900 flex items-center gap-1.5">
-                                    <Layers className="w-3.5 h-3.5 text-slate-600" />
-                                    Split Below Layout
-                                  </span>
-                                  {!formHeaderOverlay && <CheckCircle2 className="w-4 h-4 text-sky-600 fill-sky-100" />}
-                                </div>
-                                <p className="text-[10px] text-slate-500 leading-relaxed">
-                                  Places the photo gallery carousel in the top box and keeps the headline, author, and summary in a card below.
-                                </p>
-                              </button>
-                            </div>
-                          </div>
-                        )}
-
                         {/* Hidden multiple file upload input */}
                         <input
                           type="file"
@@ -2035,29 +2197,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                           >
                             <Upload className="w-4 h-4" />
                             <span>Upload Multiple Photos (Device)</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            disabled={galleryImages.length >= 10}
-                            onClick={() => {
-                              if (galleryImages.length >= 10) {
-                                showToast('Maximum 10 photos limit reached');
-                                return;
-                              }
-                              setGalleryImages([
-                                ...galleryImages,
-                                PRESET_IMAGES[galleryImages.length % PRESET_IMAGES.length].url,
-                              ]);
-                            }}
-                            className={`px-3.5 py-2.5 rounded-xl bg-white border border-sky-200 text-sky-800 text-xs font-bold flex items-center gap-1.5 shadow-2xs ${
-                              galleryImages.length >= 10
-                                ? 'cursor-not-allowed opacity-50'
-                                : 'hover:bg-sky-100/60 cursor-pointer'
-                            }`}
-                          >
-                            <Plus className="w-4 h-4 text-sky-600" />
-                            <span>Add From Preset Cinema Gallery</span>
                           </button>
 
                           {galleryImages.length > 0 && (
@@ -2171,6 +2310,153 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                           </span>
                         </div>
 
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                            Synopsis
+                          </label>
+                          <textarea
+                            value={movieSynopsis}
+                            onChange={(e) => setMovieSynopsis(e.target.value)}
+                            placeholder="Write the movie synopsis shown in the app"
+                            rows={3}
+                            className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-semibold text-slate-900"
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block text-[11px] font-bold text-slate-700">
+                                Cast members (max 15)
+                              </label>
+                              <button
+                                type="button"
+                                disabled={movieCastMembers.length >= 15}
+                                onClick={() => setMovieCastMembers((prev) => [...prev, { name: '', characterName: '', imageUrl: '' }].slice(0, 15))}
+                                className="text-[10px] font-black text-amber-800 disabled:text-slate-400"
+                              >
+                                + Add cast
+                              </button>
+                            </div>
+                            <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                              {movieCastMembers.map((member, index) => (
+                                <div key={`cast-${index}`} className="grid grid-cols-[1fr_1fr_1.4fr_auto] gap-1.5 items-center">
+                                  <input
+                                    type="text"
+                                    value={member.name}
+                                    onChange={(e) => setMovieCastMembers((prev) => prev.map((item, itemIndex) => itemIndex === index ? { ...item, name: e.target.value } : item))}
+                                    placeholder="Actor name"
+                                    className="min-w-0 px-2 py-1.5 rounded-lg bg-white border border-amber-200 text-[11px] text-slate-900"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={member.characterName}
+                                    onChange={(e) => setMovieCastMembers((prev) => prev.map((item, itemIndex) => itemIndex === index ? { ...item, characterName: e.target.value } : item))}
+                                    placeholder="Character name"
+                                    className="min-w-0 px-2 py-1.5 rounded-lg bg-white border border-amber-200 text-[11px] text-slate-900"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={member.imageUrl}
+                                    onChange={(e) => setMovieCastMembers((prev) => prev.map((item, itemIndex) => itemIndex === index ? { ...item, imageUrl: e.target.value } : item))}
+                                    placeholder="Image link or upload"
+                                    className="min-w-0 px-2 py-1.5 rounded-lg bg-white border border-amber-200 text-[11px] text-slate-900"
+                                  />
+                                  <label className="col-span-3 inline-flex w-fit items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-100 text-amber-900 text-[10px] font-black cursor-pointer hover:bg-amber-200">
+                                    <Upload className="w-3.5 h-3.5" />
+                                    {member.imageUrl ? 'Replace cast image' : 'Upload cast image'}
+                                    <input type="file" accept="image/*" onChange={(e) => handleMovieCastImageUpload(index, e)} className="sr-only" />
+                                  </label>
+                                  <button type="button" onClick={() => setMovieCastMembers((prev) => prev.filter((_, itemIndex) => itemIndex !== index))} className="text-rose-600" title="Remove cast member"><X className="w-3.5 h-3.5" /></button>
+                                </div>
+                              ))}
+                            </div>
+                            <span className="text-[10px] text-slate-500">Name, movie character, and uploaded image are saved to the app. {movieCastMembers.length} / 15</span>
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                              Related images (max 10, horizontal in app)
+                            </label>
+                            <label className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-black ${movieRelatedImages.length >= 10 ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-amber-100 text-amber-900 hover:bg-amber-200 cursor-pointer'}`}>
+                              <Upload className="w-4 h-4" />
+                              Upload related images
+                              <input
+                                type="file"
+                                accept="image/*"
+                                multiple
+                                onChange={handleMovieRelatedImagesUpload}
+                                disabled={movieRelatedImages.length >= 10}
+                                className="sr-only"
+                              />
+                            </label>
+                            <div className="flex gap-1.5 mt-2">
+                              <input
+                                type="url"
+                                value={movieRelatedImageLink}
+                                onChange={(e) => setMovieRelatedImageLink(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addMovieRelatedImageLink(); } }}
+                                placeholder="Paste image link"
+                                disabled={movieRelatedImages.length >= 10}
+                                className="min-w-0 flex-1 px-2.5 py-1.5 rounded-lg bg-white border border-amber-200 text-[11px] text-slate-900"
+                              />
+                              <button
+                                type="button"
+                                onClick={addMovieRelatedImageLink}
+                                disabled={!movieRelatedImageLink.trim() || movieRelatedImages.length >= 10}
+                                className="px-2.5 py-1.5 rounded-lg bg-slate-900 text-white text-[10px] font-black disabled:bg-slate-200 disabled:text-slate-400"
+                              >
+                                Add link
+                              </button>
+                            </div>
+                            <div className="flex gap-2 overflow-x-auto mt-2">
+                              {movieRelatedImages.map((image, index) => (
+                                <div key={`${image}-${index}`} className="relative shrink-0">
+                                  <img src={image} alt={`Related ${index + 1}`} className="w-16 h-16 object-cover rounded-lg" />
+                                  <button type="button" onClick={() => setMovieRelatedImages(movieRelatedImages.filter((_, i) => i !== index))} className="absolute -top-1 -right-1 bg-white rounded-full text-rose-600" title="Remove image"><X className="w-3 h-3" /></button>
+                                </div>
+                              ))}
+                            </div>
+                            <span className="text-[10px] text-slate-500">{movieRelatedImages.length} / 10 images</span>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                          {movieGenres.map((genre, index) => (
+                            <input
+                              key={`genre-${index}`}
+                              type="text"
+                              value={genre}
+                              onChange={(e) => setMovieGenres(movieGenres.map((item, itemIndex) => itemIndex === index ? e.target.value : item))}
+                              placeholder={`Genre ${index + 1}`}
+                              className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
+                            />
+                          ))}
+                        </div>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                          <input type="date" value={movieReleaseDate} onChange={(e) => setMovieReleaseDate(e.target.value)} className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900" />
+                          <select value={movieReleaseStatus} onChange={(e) => setMovieReleaseStatus(e.target.value as 'Released' | 'Not yet released')} className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"><option>Released</option><option>Not yet released</option></select>
+                          <select value={movieCountry} onChange={(e) => setMovieCountry(e.target.value)} className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900">
+                            {['India', 'United States', 'United Kingdom', 'Other'].map((country) => <option key={country}>{country}</option>)}
+                          </select>
+                          <div className="rounded-lg bg-white border border-amber-200 px-2 py-1.5">
+                            <span className="block text-[10px] font-bold text-slate-500 mb-1">Languages</span>
+                            <div className="flex flex-wrap gap-x-2 gap-y-1">
+                              {['Malayalam', 'Tamil', 'Telugu', 'Kannada', 'Hindi', 'Bengali', 'Marathi', 'Other'].map((language) => (
+                                <label key={language} className="flex items-center gap-1 text-[10px] font-bold text-slate-700">
+                                  <input
+                                    type="checkbox"
+                                    checked={movieLanguage.includes(language)}
+                                    onChange={(e) => setMovieLanguage((current) => e.target.checked ? [...new Set([...current, language])] : current.filter((item) => item !== language))}
+                                  />
+                                  {language}
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                          <input type="text" value={movieProductionCompany} onChange={(e) => setMovieProductionCompany(e.target.value)} placeholder="Production company" className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900" />
+                        </div>
+
                         {/* Row 1: Director, Lead Cast, Music Director */}
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                           <div>
@@ -2182,18 +2468,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                               value={movieDirector}
                               onChange={(e) => setMovieDirector(e.target.value)}
                               placeholder="e.g. Vysakh"
-                              className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                              Star Cast
-                            </label>
-                            <input
-                              type="text"
-                              value={movieCast}
-                              onChange={(e) => setMovieCast(e.target.value)}
-                              placeholder="e.g. Unni Mukundan, Siddique, Lena"
                               className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
                             />
                           </div>
@@ -2253,67 +2527,18 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                             <label className="block text-[11px] font-bold text-slate-700 mb-1">
                               Certificate
                             </label>
-                            <input
-                              type="text"
+                            <select
                               value={movieCertificate}
                               onChange={(e) => setMovieCertificate(e.target.value)}
                               placeholder="e.g. U/A 16+"
                               className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
-                            />
+                            >
+                              <option value="">Select certificate</option>
+                              {['U', 'U/A', 'A', 'S', 'Not Rated'].map((certificate) => <option key={certificate}>{certificate}</option>)}
+                            </select>
                           </div>
                         </div>
 
-                        {/* Row 3: Positives (What Works), Negatives, Verdict, Star Rating (10 Scale) */}
-                        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                          <div>
-                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                              People Rating (Out of 10)
-                            </label>
-                            <input
-                              type="text"
-                              value={movieStarRating}
-                              onChange={(e) => setMovieStarRating(e.target.value)}
-                              placeholder="e.g. 8.8"
-                              className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                              Verdict / Recommendation
-                            </label>
-                            <input
-                              type="text"
-                              value={movieVerdict}
-                              onChange={(e) => setMovieVerdict(e.target.value)}
-                              placeholder="e.g. MUST WATCH"
-                              className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                              What Works / Highlights
-                            </label>
-                            <input
-                              type="text"
-                              value={moviePros}
-                              onChange={(e) => setMoviePros(e.target.value)}
-                              placeholder="e.g. Mass intervals, Crisp BGM"
-                              className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                              Critique / Negatives
-                            </label>
-                            <input
-                              type="text"
-                              value={movieCons}
-                              onChange={(e) => setMovieCons(e.target.value)}
-                              placeholder="e.g. Predictable second half"
-                              className="w-full px-3 py-2 rounded-lg bg-white border border-amber-200 text-xs font-bold text-slate-900"
-                            />
-                          </div>
-                        </div>
                       </div>
                     )}
 
@@ -2416,7 +2641,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                       headline={formTitle}
                       category={formCategory}
                       summary={formSummary}
-                      fullContent={formFullContent}
+                      fullContent={formSummary}
                       mediaType={mediaType}
                       imageUrl={formFeatureImage}
                       videoUrl={rawVideoUrl}
@@ -2429,11 +2654,12 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                       formatType={articleFormatTab}
                       headerOverlay={formHeaderOverlay}
                       pollOptions={pollOptions}
-                      galleryImages={galleryImages}
+                      galleryImages={articleFormatTab === 'movie_review' ? movieRelatedImages : galleryImages}
                       movieVerdict={movieVerdict}
                       movieRating={movieStarRating}
                       movieDirector={movieDirector}
-                      movieCast={movieCast}
+                      movieCast={movieCastMembers.map((member) => member.name).filter(Boolean).join(', ')}
+                      movieCastMembers={movieCastMembers}
                       movieMusicDirector={movieMusicDirector}
                       movieCinematography={movieCinematography}
                       movieRuntime={movieRuntime}
@@ -2477,6 +2703,17 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                     <span>Poll & Quiz Data ({pollArticles.length})</span>
                   </button>
                   <button
+                    onClick={() => setDataHubTab('ratings')}
+                    className={`px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                      dataHubTab === 'ratings'
+                        ? 'bg-indigo-600 text-white shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Star className="w-3.5 h-3.5" />
+                    <span>Movie Ratings ({reviewArticles.length})</span>
+                  </button>
+                  <button
                     onClick={() => setDataHubTab('ask_readers')}
                     className={`px-4 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
                       dataHubTab === 'ask_readers'
@@ -2502,7 +2739,8 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                   ) : (
                     pollArticles.map((poll) => {
                       const options: any[] = poll.choiceOptions || [];
-                      const totalVotes = options.reduce((sum, o) => sum + (o.votes || 0), 0) || 120;
+                      const liveStats = interactionStats[poll.id];
+                      const totalVotes = liveStats?.totalVotes || options.reduce((sum, o) => sum + (o.votes || 0), 0);
                       return (
                         <div
                           key={poll.id}
@@ -2531,8 +2769,10 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                           {/* Options Vote Breakdown Bars */}
                           <div className="space-y-2.5">
                             {options.map((opt: any, idx: number) => {
-                              const votes = opt.votes || (idx === 0 ? 84 : 36);
-                              const pct = Math.round((votes / totalVotes) * 100);
+                              const votes = liveStats?.optionVotes[String(idx)] ?? opt.votes ?? 0;
+                              const pct = totalVotes > 0
+                                ? Math.round((votes / totalVotes) * 100)
+                                : 0;
                               return (
                                 <div key={opt.id || idx} className="space-y-1">
                                   <div className="flex items-center justify-between text-xs font-bold text-slate-700">
@@ -2575,6 +2815,38 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                       );
                     })
                   )}
+                </div>
+              )}
+
+              {dataHubTab === 'ratings' && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  {reviewArticles.length === 0 ? (
+                    <div className="col-span-2 py-16 text-center bg-white rounded-2xl border border-slate-200">
+                      <Star className="w-8 h-8 text-slate-400 mx-auto mb-2" />
+                      <p className="text-sm font-bold text-slate-700">No movie reviews found</p>
+                    </div>
+                  ) : reviewArticles.map((review) => {
+                    const stats = interactionStats[review.id];
+                    const average = stats?.averageRating || Number(review.starRating || review.rating || 0);
+                    return (
+                      <div key={review.id} className="bg-white p-5 rounded-2xl border border-slate-200/90 shadow-2xs space-y-4">
+                        <h3 className="text-sm font-black text-slate-900 line-clamp-2">{review.title}</h3>
+                        <div className="flex items-end justify-between">
+                          <span className="text-4xl font-black text-indigo-700">{average.toFixed(1)}</span>
+                          <span className="text-xs font-bold text-slate-500">
+                            {stats?.totalRatings || 0} live ratings • {stats?.totalWatched || 0} watched
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-5 gap-2 items-end h-20">
+                          {[1, 2, 3, 4, 5].map((rating) => {
+                            const count = stats?.ratingCounts[String(rating)] || 0;
+                            const max = Math.max(...[1, 2, 3, 4, 5].map((value) => stats?.ratingCounts[String(value)] || 0), 1);
+                            return <div key={rating} className="flex flex-col items-center gap-1"><div className="w-full bg-emerald-400 rounded-t" style={{ height: `${Math.max(6, (count / max) * 58)}px` }} /><span className="text-[10px] text-slate-500">{rating}</span></div>;
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
@@ -2744,7 +3016,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                         <div className="flex items-start gap-3.5 flex-1 min-w-0">
                           <div className="relative w-16 h-16 sm:w-20 sm:h-20 rounded-xl overflow-hidden bg-slate-100 shrink-0 border border-slate-200">
                             <img
-                              src={art.featureImage || PRESET_IMAGES[0].url}
+                              src={art.featureImage || ''}
                               alt=""
                               className="w-full h-full object-cover"
                               referrerPolicy="no-referrer"
@@ -2785,13 +3057,15 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                             <h3 className="text-sm font-bold text-slate-900 truncate">
                               {art.title}
                             </h3>
-                            <p className="text-xs text-slate-500 line-clamp-2 mt-0.5 leading-relaxed">
+                            <p className="text-sm text-slate-500 line-clamp-2 mt-0.5 leading-relaxed">
                               {art.summary}
                             </p>
 
                             <div className="flex items-center gap-4 text-[11px] text-slate-400 font-semibold mt-2">
                               <span>By {art.author || 'UPROLL Desk'}</span>
-                              <span>• {art.date || 'Just now'}</span>
+                              <span className="inline-flex w-20 shrink-0 truncate">
+                                • {art.date || 'Just now'}
+                              </span>
                               <span className="flex items-center gap-1 text-slate-600">
                                 <Eye className="w-3 h-3" />
                                 {art.opensCount ? art.opensCount * 140 : 420} views
@@ -2874,11 +3148,11 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-2xl font-black text-slate-900 tracking-tight flex items-center gap-2.5">
-                    <DollarSign className="w-6 h-6 text-emerald-600" />
-                    <span>Monetization & Ads</span>
+                    <Megaphone className="w-6 h-6 text-emerald-600" />
+                    <span>Sponsored Content</span>
                   </h2>
                   <p className="text-xs sm:text-sm text-slate-500 font-medium mt-0.5">
-                    Manage Google AdMob programmatic ads, in-feed native card frequency, direct brand sponsorships, and cinema ticketing affiliate tags
+                    Manage sponsored stories, image galleries, video campaigns, and coupon promotions delivered from Firestore
                   </p>
                 </div>
                 <div className="flex items-center gap-2.5">
@@ -2890,7 +3164,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                     className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-md shadow-emerald-600/20 transition-all cursor-pointer"
                   >
                     <Check className="w-4 h-4" />
-                    <span>Save Ad Configuration</span>
+                    <span>Save Campaign Settings</span>
                   </button>
                 </div>
               </div>
@@ -3070,7 +3344,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                           required
                           value={monetizeBrand}
                           onChange={(e) => setMonetizeBrand(e.target.value)}
-                          placeholder="e.g. Joyalukkas, Malabar Gold, BookMyShow"
+                          placeholder="Enter advertiser name"
                           className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-bold text-slate-900 focus:bg-white focus:outline-none focus:border-amber-500"
                         />
                       </div>
@@ -3161,7 +3435,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                         required={monetizeFormatTab !== 'full_gallery'}
                         value={monetizeHeadline}
                         onChange={(e) => setMonetizeHeadline(e.target.value)}
-                        placeholder={monetizeFormatTab === 'full_gallery' ? "e.g. Joyalukkas Bridal Lookbook 2025" : "e.g. Joyalukkas Diamond Fest: 10 Exclusive Looks (Max 80 chars)"}
+                        placeholder={monetizeFormatTab === 'full_gallery' ? 'Enter gallery headline' : 'Enter sponsored story headline'}
                         className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-bold text-slate-900 focus:bg-white focus:outline-none focus:border-amber-500"
                       />
                     </div>
@@ -3245,19 +3519,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                             >
                               <Upload className="w-3.5 h-3.5" />
                               <span>Upload Photos</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (monetizeGalleryImages.length < 10) {
-                                  const randomPreset = PRESET_IMAGES[Math.floor(Math.random() * PRESET_IMAGES.length)].url;
-                                  setMonetizeGalleryImages([...monetizeGalleryImages, randomPreset]);
-                                }
-                              }}
-                              disabled={monetizeGalleryImages.length >= 10}
-                              className="px-2.5 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 text-xs font-bold transition-all cursor-pointer disabled:opacity-50"
-                            >
-                              + Add Preset
                             </button>
                           </div>
                         </div>
@@ -3346,28 +3607,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                             </div>
                           )}
 
-                          <div className="flex-1 space-y-1.5">
-                            <span className="text-[11px] text-slate-500 font-bold block">Quick Presets:</span>
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              {PRESET_IMAGES.map((p, i) => (
-                                <button
-                                  key={i}
-                                  type="button"
-                                  onClick={() => {
-                                    setMonetizeRawImageFile(null);
-                                    setMonetizeFeatureImage(p.url);
-                                  }}
-                                  className={`text-[10px] px-2.5 py-1 rounded-lg border font-semibold transition-all cursor-pointer ${
-                                    monetizeFeatureImage === p.url && !monetizeRawImageFile
-                                      ? 'bg-amber-500 text-white border-amber-500 font-bold shadow-2xs'
-                                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                  }`}
-                                >
-                                  {p.label}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
                         </div>
                       </div>
                     )}
@@ -3462,7 +3701,7 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                         >
                           <div className="flex items-start gap-3">
                             <img
-                              src={art.featureImage || (art.galleryImages && art.galleryImages[0]) || PRESET_IMAGES[0].url}
+                              src={art.featureImage || (art.galleryImages && art.galleryImages[0]) || ''}
                               alt={art.title}
                               className="w-16 h-16 rounded-xl object-cover border border-slate-200 shrink-0"
                               referrerPolicy="no-referrer"
@@ -3542,50 +3781,6 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                 </div>
               </div>
 
-              {/* 4. Cinema Ticketing & Affiliate Partnerships */}
-              <div className="bg-white p-6 rounded-2xl border border-slate-200/90 shadow-2xs space-y-4">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-600">
-                    <Film className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h3 className="text-sm font-extrabold text-slate-900">
-                      Cinema Ticketing & OTT Affiliate Integration
-                    </h3>
-                    <p className="text-xs text-slate-500 font-medium mt-0.5">
-                      Automatically appends affiliate booking buttons to Box Office updates and Movie Review cards
-                    </p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      BookMyShow / Ticket Referral Partner ID
-                    </label>
-                    <input
-                      type="text"
-                      value={affiliateBmsId}
-                      onChange={(e) => setAffiliateBmsId(e.target.value)}
-                      placeholder="e.g. UPROLL_BMS_PARTNER_2026"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono text-slate-900 focus:bg-white focus:outline-none focus:border-blue-600"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      OTT / Streaming Affiliate Referral Tag
-                    </label>
-                    <input
-                      type="text"
-                      value={affiliateOttId}
-                      onChange={(e) => setAffiliateOttId(e.target.value)}
-                      placeholder="e.g. UPROLL_HOTSTAR_AFFILIATE"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono text-slate-900 focus:bg-white focus:outline-none focus:border-blue-600"
-                    />
-                  </div>
-                </div>
-              </div>
             </div>
           )}
 
@@ -3709,187 +3904,134 @@ export function WhiteCmsDashboard({ onOpenMobileReader, onSelectArticleForReader
                 </div>
               </div>
 
-              {/* General App Configuration */}
+              {/* Database Routing */}
               <div className="bg-white p-6 rounded-2xl border border-slate-200/90 shadow-2xs space-y-4">
-                <h3 className="text-sm font-extrabold uppercase tracking-wider text-slate-900 flex items-center gap-2">
-                  <Globe className="w-4 h-4 text-indigo-600" />
-                  <span>Branding & Reader Rules</span>
-                </h3>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      App Name
-                    </label>
-                    <input
-                      type="text"
-                      value={appName}
-                      onChange={(e) => setAppName(e.target.value)}
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-bold text-slate-900"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Default Editorial Author
-                    </label>
-                    <input
-                      type="text"
-                      value={defaultAuthor}
-                      onChange={(e) => setDefaultAuthor(e.target.value)}
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-bold text-slate-900"
-                    />
-                  </div>
-                </div>
-
-                <div className="pt-3 border-t border-slate-100">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-black uppercase tracking-wider text-slate-800">
-                      Feed Snippet Target Word Count
-                    </label>
-                    <span className="text-xs font-extrabold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-lg border border-indigo-200">
-                      Current Target: {targetWordCount} Words
-                    </span>
-                  </div>
-                  
-                  <div className="flex flex-wrap items-center gap-3">
-                    <input
-                      type="number"
-                      min={20}
-                      max={300}
-                      value={targetWordCount}
-                      onChange={(e) => {
-                        updateTargetWordCount(Number(e.target.value));
-                        showToast(`Target word count updated to ${e.target.value} words`);
-                      }}
-                      className="w-28 px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-300 text-sm font-black text-slate-900 focus:bg-white focus:outline-none focus:border-indigo-600 shadow-2xs"
-                    />
-                    
-                    {/* Quick Presets */}
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {[
-                        { label: '26w (Standard: 190 chars)', val: 26 },
-                        { label: '40w (Extended News)', val: 40 },
-                        { label: '60w (Extended Summary)', val: 60 },
-                        { label: '80w (In-Depth Card)', val: 80 },
-                      ].map((preset) => (
-                        <button
-                          key={preset.val}
-                          type="button"
-                          onClick={() => {
-                            updateTargetWordCount(preset.val);
-                            showToast(`Target set to ${preset.label}`);
-                          }}
-                          className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
-                            targetWordCount === preset.val
-                              ? 'bg-indigo-600 text-white border-indigo-600 shadow-2xs'
-                              : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                          }`}
-                        >
-                          {preset.label}
-                        </button>
-                      ))}
+                <div className="flex items-start justify-between gap-4 flex-wrap">
+                  <div className="flex items-start gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-emerald-50 border border-emerald-100 flex items-center justify-center text-emerald-600">
+                      <Database className="w-5 h-5" />
                     </div>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-2 font-medium">
-                    This setting dynamically controls word validation thresholds, character progress bars, and warnings across the article creator and live mobile card previews.
-                  </p>
-                </div>
-              </div>
-
-              {/* Categories Management */}
-              <div className="bg-white p-6 rounded-2xl border border-slate-200/90 shadow-2xs space-y-4">
-                <h3 className="text-sm font-extrabold uppercase tracking-wider text-slate-900 flex items-center gap-2">
-                  <Layers className="w-4 h-4 text-indigo-600" />
-                  <span>Category Hierarchy</span>
-                </h3>
-
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={newCatInput}
-                    onChange={(e) => setNewCatInput(e.target.value)}
-                    placeholder="Add new category (e.g. Malayalam OTT)"
-                    className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-medium text-slate-900"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (newCatInput.trim() && !categoriesList.includes(newCatInput.trim())) {
-                        setCategoriesList([...categoriesList, newCatInput.trim()]);
-                        setNewCatInput('');
-                        showToast('Category added!');
-                      }
-                    }}
-                    className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold cursor-pointer"
-                  >
-                    + Add
-                  </button>
-                </div>
-
-                <div className="flex flex-wrap gap-2 pt-2">
-                  {categoriesList.map((cat, idx) => (
-                    <div
-                      key={cat}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 text-slate-800 text-xs font-bold border border-slate-200"
-                    >
-                      <span>{cat}</span>
-                      {categoriesList.length > 3 && (
-                        <button
-                          type="button"
-                          onClick={() => setCategoriesList(categoriesList.filter((_, i) => i !== idx))}
-                          className="text-slate-400 hover:text-rose-600"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Database & Cloud Status */}
-              <div className="bg-white p-6 rounded-2xl border border-slate-200/90 shadow-2xs space-y-4">
-                <h3 className="text-sm font-extrabold uppercase tracking-wider text-slate-900 flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                  <span>Cloud Database Health</span>
-                </h3>
-
-                <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
                     <div>
-                      <h4 className="text-xs font-extrabold text-emerald-950">
-                        Google Cloud Firestore Connected
-                      </h4>
-                      <p className="text-[11px] text-emerald-700">
-                        Live snapshot listeners active for collection <code>articles</code>
+                      <h3 className="text-sm font-extrabold text-slate-900">Database Routing</h3>
+                      <p className="text-xs text-slate-500 font-medium mt-0.5">
+                        Choose which data provider the app should use.
                       </p>
                     </div>
                   </div>
-                  <span className="px-3 py-1 rounded-full bg-white text-emerald-800 text-xs font-black shadow-2xs">
-                    {articles.length} Documents
+                  <span className={`text-[10px] px-2 py-1 rounded-full font-black uppercase tracking-wide ${
+                    databaseMode === 'firebase'
+                      ? 'bg-orange-100 text-orange-700'
+                      : 'bg-sky-100 text-sky-700'
+                  }`}>
+                    {databaseMode === 'firebase' ? 'Firebase active' : 'Local database active'}
                   </span>
                 </div>
 
-                <div className="flex items-center justify-between pt-2">
-                  <span className="text-xs text-slate-500 font-medium">
-                    Reset demo database with fresh Kerala cinema headlines?
-                  </span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-1 rounded-xl bg-slate-100 border border-slate-200">
                   <button
                     type="button"
-                    onClick={async () => {
-                      if (confirm('Re-seed initial sample articles?')) {
-                        await seedArticlesIfEmpty();
-                        showToast('Database checked and re-seeded');
-                      }
-                    }}
-                    className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold cursor-pointer"
+                    disabled={isDatabaseModeSaving || userRole !== 'admin'}
+                    onClick={() => requestDatabaseModeChange('firebase')}
+                    className={`rounded-lg px-3 py-2.5 text-xs font-black transition-all cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 ${
+                      databaseMode === 'firebase'
+                        ? 'bg-white text-orange-700 shadow-sm border border-orange-200'
+                        : 'text-slate-500 hover:text-slate-900'
+                    }`}
                   >
-                    Re-seed Sample Stories
+                    Firebase
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isDatabaseModeSaving || userRole !== 'admin'}
+                    onClick={() => requestDatabaseModeChange('local')}
+                    className={`rounded-lg px-3 py-2.5 text-xs font-black transition-all cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 ${
+                      databaseMode === 'local'
+                        ? 'bg-white text-sky-700 shadow-sm border border-sky-200'
+                        : 'text-slate-500 hover:text-slate-900'
+                    }`}
+                  >
+                    Local Database
                   </button>
                 </div>
+
+                <p className="text-[11px] leading-relaxed text-slate-400">
+                  This setting is shared through <span className="font-bold text-slate-500">app_settings/global</span>. The local database service must be connected before local mode is used in production.
+                </p>
               </div>
+
+              {showDatabasePasswordModal && pendingDatabaseMode && (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+                  <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+                    <div className="mb-4 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-emerald-600">Admin verification</p>
+                        <h3 className="mt-1 text-xl font-black text-slate-900">Authenticate switch</h3>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowDatabasePasswordModal(false);
+                          setDatabaseModePassword('');
+                          setDatabaseModePasswordError('');
+                          setPendingDatabaseMode(null);
+                        }}
+                        className="rounded-full border border-slate-200 bg-slate-100 p-2 text-slate-600 transition hover:bg-slate-200"
+                        aria-label="Close password prompt"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    <p className="mb-4 text-sm text-slate-600">
+                      Enter the admin password to switch to <span className="font-bold text-slate-800">{pendingDatabaseMode === 'local' ? 'Local Database' : 'Firebase'}</span>.
+                    </p>
+
+                    <label className="block text-sm font-bold text-slate-800">
+                      Authentication password
+                      <input
+                        type="password"
+                        value={databaseModePassword}
+                        onChange={(event) => {
+                          setDatabaseModePassword(event.target.value);
+                          if (databaseModePasswordError) setDatabaseModePasswordError('');
+                        }}
+                        className="mt-2 w-full rounded-xl border border-slate-300 bg-slate-50 px-3 py-2.5 text-slate-900 outline-none transition focus:border-emerald-500 focus:bg-white"
+                        placeholder="Enter password"
+                        autoFocus
+                      />
+                    </label>
+
+                    {databaseModePasswordError && (
+                      <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs font-medium text-red-600">
+                        {databaseModePasswordError}
+                      </p>
+                    )}
+
+                    <div className="mt-5 flex items-center justify-end gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowDatabasePasswordModal(false);
+                          setDatabaseModePassword('');
+                          setDatabaseModePasswordError('');
+                          setPendingDatabaseMode(null);
+                        }}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-bold text-slate-700 transition hover:bg-slate-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={confirmDatabaseModeChange}
+                        className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-black text-slate-950 transition hover:bg-emerald-400"
+                      >
+                        Confirm switch
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
             </div>
           )}
         </main>
